@@ -1232,7 +1232,18 @@ cmd_climb() {
         bwrap_args+=(--ro-bind /etc/resolv.conf /etc/resolv.conf)
     fi
 
-    # X11
+    # Session sockets are exposed through the /tmp tmpfs, never at their
+    # host paths inside the tree: bind targets under the TREE (/root/.Xauthority,
+    # /run/user/<uid>) are root-owned and an unprivileged climb got
+    # EPERM trying to create them (X11 died on /root/.Xauthority,
+    # Wayland on "Can't mkdir parents for /run/user/..."). Clients dial
+    # these via $XAUTHORITY / $XDG_RUNTIME_DIR / $DBUS_SESSION_BUS_ADDRESS,
+    # so relocating the env is all they need.
+    local xdg="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    local rt="/tmp/xdg-runtime"
+    local have_rt=false
+
+    # X11 (+ its socket, previously never bound — X11 could not work at all)
     if [ -n "${DISPLAY:-}" ]; then
         bwrap_args+=(--setenv DISPLAY "$DISPLAY")
         local xauth_file=""
@@ -1242,27 +1253,30 @@ cmd_climb() {
             xauth_file="${HOME}/.Xauthority"
         fi
         if [ -n "$xauth_file" ]; then
-            bwrap_args+=(--ro-bind "$xauth_file" /root/.Xauthority)
-            bwrap_args+=(--setenv XAUTHORITY /root/.Xauthority)
+            bwrap_args+=(--ro-bind "$xauth_file" /tmp/.Xauthority-tower)
+            bwrap_args+=(--setenv XAUTHORITY /tmp/.Xauthority-tower)
+        fi
+        if [ -d /tmp/.X11-unix ]; then
+            bwrap_args+=(--ro-bind /tmp/.X11-unix /tmp/.X11-unix)
         fi
     fi
 
     # Wayland
-    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
-        local xdg="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-        local ws="$xdg/$WAYLAND_DISPLAY"
-        if [ -S "$ws" ]; then
-            bwrap_args+=(--ro-bind "$ws" "$ws")
-            bwrap_args+=(--setenv WAYLAND_DISPLAY "$WAYLAND_DISPLAY")
-            bwrap_args+=(--setenv XDG_RUNTIME_DIR "$xdg")
-        fi
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && [ -S "$xdg/$WAYLAND_DISPLAY" ]; then
+        bwrap_args+=(--ro-bind "$xdg/$WAYLAND_DISPLAY" "$rt/$WAYLAND_DISPLAY")
+        bwrap_args+=(--setenv WAYLAND_DISPLAY "$WAYLAND_DISPLAY")
+        have_rt=true
     fi
 
     # D-Bus
-    local xdg="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
     if [ -S "$xdg/bus" ]; then
-        bwrap_args+=(--ro-bind "$xdg/bus" "$xdg/bus")
-        bwrap_args+=(--setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$xdg/bus")
+        bwrap_args+=(--ro-bind "$xdg/bus" "$rt/bus")
+        bwrap_args+=(--setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$rt/bus")
+        have_rt=true
+    fi
+
+    if [ "$have_rt" = true ]; then
+        bwrap_args+=(--setenv XDG_RUNTIME_DIR "$rt")
     fi
 
     exec bwrap "${bwrap_args[@]}" "$shell"
