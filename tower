@@ -881,9 +881,11 @@ cmd_rebuild() {
     [ -n "$dir" ] || die "missing directory (usage: tower rebuild <dir>)"
     [ -d "$dir" ] || die "directory not found: $dir"
 
-    # auto-detect kernel
-    local vmlinuz
-    vmlinuz=$(ls -t "$dir"/boot/vmlinuz-* 2>/dev/null | sort -V | tail -1)
+    # auto-detect kernel — `|| true` is load-bearing: with pipefail an
+    # unmatched glob makes ls exit 2 and would kill the script BEFORE
+    # die() could print anything (the original silent-failure bug).
+    local vmlinuz=""
+    vmlinuz=$(ls -t "$dir"/boot/vmlinuz-* 2>/dev/null | sort -V | tail -1) || true
     [ -n "$vmlinuz" ] || die "Cannot build an ISO of this tree, Are you sure there is a kernel installed inside?"
     local vmlinuz_name
     vmlinuz_name=$(basename "$vmlinuz")
