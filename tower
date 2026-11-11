@@ -1,0 +1,1115 @@
+#!/bin/bash
+# foundation : Haliade deployment tool (the "pacstrap" of HaliadeSYS)
+# Single command: tower
+#
+# Replaces zstrappa. See README.md for usage.
+
+set -euo pipefail
+# helpers 
+
+die() { echo "error: $*" >&2; exit 1; }
+info() { echo "[info] $*"; }
+ok() { echo "[ok] $*"; }
+warn() { echo "warning: $*" >&2; }
+
+usage() {
+    cat <<'EOF'
+foundation | Haliade system deployment tool
+"Every wind turbine needs a tower."
+
+Usage:
+  tower place  [--uefi|--bios] [root] [boot] [home] [--pass] [--init NAME] [--config PATH]
+               [--enable-generator NAME] [--enable-house-generator NAME]
+               [--system-generators-file PATH] [--house-generators-file PATH]
+  tower clone  [--uefi|--bios] [root] [boot] [home]
+  tower deploy <dir>
+  tower rebuild <dir>
+  tower climb  <dir> [shell]
+  tower enable-generators <dir> [system|house] <name...>
+  tower help
+
+Subcommands:
+  place    Bootstrap a Haliade system onto a drive 
+  clone    copy the whole live / into a partition.
+  deploy   Deploy an Haliade root filesystem tree somewhere.
+  rebuild  Build a bootable ISO from a Haliade root filesystem tree 
+  climb    Enter a root filesystem tree
+
+Flags (place only):
+  --pass                  Do not ask for confirmation to bootstrap.
+  --init NAME             Install an init of the user's choice
+  --config PATH           Synchronize a Nacelle config into the deployed system.
+  --enable-generator NAME Enable a system generator (repeatable).
+  --enable-house-generator NAME
+                          Enable a house generator (repeatable).
+  --system-generators-file PATH
+                          Copy a system generators file into the deployed system.
+  --house-generators-file PATH
+                          Copy a house generators file into the deployed system.
+  --uefi/--bios           Force bootloader mode.
+EOF
+    exit 0
+}
+
+check_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "Error: tower must be run with root privileges" >&2
+        exit 1
+    fi
+}
+
+validate_device() {
+    local dev="$1" label="$2"
+    if [ ! -b "$dev" ]; then
+        echo "Error: $label $dev is not a block device" >&2
+        exit 1
+    fi
+    if mount | grep -q "^$dev "; then
+        echo "Error: $label $dev is already mounted" >&2
+        exit 1
+    fi
+}
+
+detect_uefi() {
+    if [ -n "${UEFI_OVERRIDE:-}" ]; then
+        [ "$UEFI_OVERRIDE" = "1" ]
+        return
+    fi
+    [ -d /sys/firmware/efi ]
+}
+
+UEFI_OVERRIDE=""
+PASS=false
+INIT=""
+CONFIG=""
+POSITIONAL=()
+ENABLE_GENERATORS=()
+HOUSE_GENERATORS=()
+SYSTEM_GENERATORS_FILE=""
+HOUSE_GENERATORS_FILE=""
+parse_place() {
+    UEFI_OVERRIDE=""
+    PASS=false
+    INIT=""
+    CONFIG=""
+    ENABLE_GENERATORS=()
+    HOUSE_GENERATORS=()
+    SYSTEM_GENERATORS_FILE=""
+    HOUSE_GENERATORS_FILE=""
+    POSITIONAL=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --uefi) UEFI_OVERRIDE=1; shift ;;
+            --bios) UEFI_OVERRIDE=0; shift ;;
+            --pass) PASS=true; shift ;;
+            --init) INIT="${2:-}"; shift 2 ;;
+            --config) CONFIG="${2:-}"; shift 2 ;;
+            --enable-generator) ENABLE_GENERATORS+=("${2:-}"); shift 2 ;;
+            --enable-house-generator) HOUSE_GENERATORS+=("${2:-}"); shift 2 ;;
+            --system-generators-file) SYSTEM_GENERATORS_FILE="${2:-}"; shift 2 ;;
+            --house-generators-file) HOUSE_GENERATORS_FILE="${2:-}"; shift 2 ;;
+            -h|--help) usage ;;
+            --) shift; break ;;
+            *) POSITIONAL+=("$1"); shift ;;
+        esac
+    done
+    POSITIONAL+=("$@")
+}
+
+parse_clone() {
+    UEFI_OVERRIDE=""
+    POSITIONAL=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --uefi) UEFI_OVERRIDE=1; shift ;;
+            --bios) UEFI_OVERRIDE=0; shift ;;
+            --pass|--init|--config)
+                die "flags cannot be used with 'clone'" ;;
+            -h|--help) usage ;;
+            --) shift; break ;;
+            *) POSITIONAL+=("$1"); shift ;;
+        esac
+    done
+    POSITIONAL+=("$@")
+}
+
+zeta_bin() {
+    if command -v zeta >/dev/null 2>&1; then
+        command -v zeta
+        return 0
+    fi
+    for c in /usr/bin/zeta /home/gretagen/haliade-root/usr/bin/zeta /home/gretagen/ZETA/bin/zeta; do
+        [ -x "$c" ] && { echo "$c"; return 0; }
+    done
+    return 1
+}
+
+setup_boot_partition_uefi() {
+    local part="$1" part_num disk fstype
+    part_num=$(echo "$part" | grep -o '[0-9]*$')
+    disk=$(echo "$part" | sed 's/[0-9]*$//')
+    disk=$(echo "$disk" | sed 's/p$//')
+
+    fstype=$(blkid -s TYPE -o value "$part" 2>/dev/null || echo "")
+    if [ "$fstype" = "vfat" ]; then
+        echo "Boot partition $part is already FAT32."
+        return
+    fi
+    echo "Formatting $part as FAT32 (EFI System Partition)..."
+    mkfs.vfat -v -F 32 "$part" || die "Failed to format $part as FAT32"
+
+    if sfdisk -d "$disk" 2>/dev/null | grep -q 'label: gpt'; then
+        echo "Setting partition type to EFI System..."
+        sfdisk --part-type "$disk" "$part_num" "C12A7328-F81F-11D2-BA4B-00A0C93EC93B" 2>/dev/null || warn "Failed to set GPT partition type"
+    fi
+}
+
+format_home_if_needed() {
+    local part="$1"
+    [ -z "$part" ] && return 0
+    local fstype
+    fstype=$(blkid -s TYPE -o value "$part" 2>/dev/null || echo "")
+    if [ -z "$fstype" ]; then
+        echo "Formatting $part as ext4 (home)..."
+        mkfs.ext4 -F -L haliade-home "$part" || die "Failed to format $part"
+    fi
+}
+
+mount_target() {
+    # args: root boot home mp
+    local root="$1" boot="$2" home="$3" mp="$4"
+    if detect_uefi; then
+        [ -n "$boot" ] || die "--uefi requires a boot partition (ESP)"
+        setup_boot_partition_uefi "$boot"
+    fi
+    mkdir -p /mnt
+    mkdir -p "$mp"
+    echo "Formatting $root as btrfs..."
+    mkfs.btrfs -f -L haliade "$root" || die "Failed to format $root"
+
+    local tl
+    tl=$(mktemp -d /mnt/foundation-tl.XXXXXX)
+    mount "$root" "$tl" || die "Failed to mount $root for subvolume setup"
+    echo "Creating btrfs subvolumes @ and @snapshots..."
+    btrfs subvolume create "$tl/@" || { umount "$tl"; rmdir "$tl"; die "Failed to create @"; }
+    btrfs subvolume create "$tl/@snapshots" || { umount "$tl"; rmdir "$tl"; die "Failed to create @snapshots"; }
+    umount "$tl"
+    rmdir "$tl"
+
+    mount -o subvol=@ "$root" "$mp" || die "Failed to mount $root subvol=@ on $mp"
+    mkdir -p "$mp/.snapshots"
+    mount -o subvol=@snapshots "$root" "$mp/.snapshots" || { umount "$mp"; die "Failed to mount @snapshots"; }
+
+    if [ -n "$boot" ]; then
+        mkdir -p "$mp/boot"
+        mount "$boot" "$mp/boot" || die "Failed to mount $boot on $mp/boot"
+    fi
+    if [ -n "$home" ]; then
+        format_home_if_needed "$home"
+        mkdir -p "$mp/home"
+        mount "$home" "$mp/home" || die "Failed to mount $home on $mp/home"
+    fi
+}
+
+cleanup_mounts() {
+    local mp="$1" boot="$2" home="$3"
+    sync
+    umount "$mp/home" 2>/dev/null || true
+    umount "$mp/boot" 2>/dev/null || true
+    umount "$mp/.snapshots" 2>/dev/null || true
+    umount "$mp" 2>/dev/null || true
+}
+
+# zstrappa-derived helpers (used by clone) 
+
+LIVE_ONLY_PATHS="/intro
+/usr/sbin/haliade-boot-intro
+/fastboot"
+
+purge_live_only() {
+    echo "Removing the live boot's artifacts from the install source..."
+    local p removed=0
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if [ -e "$p" ] || [ -L "$p" ]; then
+            rm -f "$p" || { echo "Error: could not remove $p" >&2; return 1; }
+            echo "  removed $p"
+            removed=$((removed + 1))
+        fi
+    done <<< "$LIVE_ONLY_PATHS"
+    [ "$removed" -gt 0 ] || echo "  nothing to remove (not a live system?)"
+}
+
+copy_rootfs() {
+    echo "Copying root filesystem (this may take a while)..."
+    local -a live_excludes=()
+    local p
+    while IFS= read -r p; do
+        [ -n "$p" ] && live_excludes+=("--exclude=$p")
+    done <<< "$LIVE_ONLY_PATHS"
+
+    rsync -aHAX -P / "$MP" \
+        --no-owner --no-group \
+        --exclude=/dev --exclude=/proc --exclude=/sys --exclude=/run \
+        --exclude=/tmp --exclude=/mnt --exclude=/lost+found \
+        --exclude=/.snapshots --exclude=/.tmp-anims \
+        "${live_excludes[@]}"
+}
+
+verify_no_live_only() {
+    local p found=()
+    while IFS= read -r p; do
+        [ -n "$p" ] && [ -e "$MP$p" ] && found+=("$p")
+    done <<< "$LIVE_ONLY_PATHS"
+    if [ ${#found[@]} -ne 0 ]; then
+        echo "Error: live-only paths reached the target:" >&2
+        printf '  %s\n' "${found[@]}" >&2
+        return 1
+    fi
+    echo "Verified: no live boot artifacts on the target."
+}
+
+get_uuid() { blkid -s UUID -o value "$1" 2>/dev/null; }
+get_partuuid() { blkid -s PARTUUID -o value "$1" 2>/dev/null; }
+
+update_boot_config() {
+    local root="$1" boot="$2" mp="$3"
+    local root_uuid part_uuid root_spec kernel initrd extras
+    root_uuid=$(get_uuid "$root")
+    part_uuid=$(get_partuuid "$root")
+    if [ -n "$root_uuid" ]; then root_spec="UUID=$root_uuid"
+    elif [ -n "$part_uuid" ]; then root_spec="PARTUUID=$part_uuid"
+    else root_spec="$root"; fi
+
+    kernel=$(ls "$mp/boot"/vmlinuz-* 2>/dev/null | head -1 | xargs -r basename)
+    [ -n "$kernel" ] || kernel="vmlinuz-6.18.10-gen"
+    if [ -f "$mp/boot/initramfs-core.img" ]; then
+        initrd="initramfs-core.img"
+    else
+        initrd=$(ls "$mp/boot"/initramfs-*.img 2>/dev/null | head -1 | xargs -r basename)
+        [ -n "$initrd" ] || initrd="initramfs-core.img"
+    fi
+
+    extras=""
+    if [ -f "$mp/etc/haliade/definition.lua" ]; then
+        extras=$(sed -n 's/.*kernel_cmdline[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$mp/etc/haliade/definition.lua" | head -1)
+    fi
+
+    local limine_conf="$mp/boot/limine.conf"
+    echo "Writing boot configuration (root=$root_spec rootflags=subvol=@)..."
+    cat > "$limine_conf" <<EOF
+# Limine configuration for Haliade system, managed by chronos
+# Do not hand-edit generation entries; run: chronos rewrite-limine
+
+timeout: 15
+serial: yes
+
+/Haliade SYS
+    protocol: linux
+    kernel_path: boot():/${kernel}
+    module_path: boot():/${initrd}
+    cmdline: root=${root_spec} rootflags=subvol=@ rw ${extras} init=/sbin/openrc-init
+EOF
+}
+
+generate_fstab() {
+    local root="$1" boot="$2" home="$3" mp="$4"
+    local root_uuid root_spec
+    root_uuid=$(get_uuid "$root")
+    if [ -n "$root_uuid" ]; then root_spec="UUID=$root_uuid"; else root_spec="$root"; fi
+
+    echo "Generating /etc/fstab..."
+    cat > "$mp/etc/fstab" << FSTAB
+# /etc/fstab - Generated by foundation
+tmpfs           /run            tmpfs           nosuid,nodev,mode=0755 0 0
+tmpfs           /tmp            tmpfs           nosuid,nodev,mode=1777 0 0
+tmpfs           /var/log        tmpfs           nosuid,nodev,mode=0755 0 0
+tmpfs           /var/cache      tmpfs           nosuid,nodev,mode=0755 0 0
+tmpfs           /var/tmp        tmpfs           nosuid,nodev,mode=1777 0 0
+tmpfs           /var/lock       tmpfs           nosuid,nodev,mode=0755 0 0
+
+${root_spec} / btrfs subvol=@,defaults,noatime 0 1
+${root_spec} /.snapshots btrfs subvol=@snapshots,defaults,noatime 0 0
+FSTAB
+
+    if [ -n "$boot" ]; then
+        local boot_uuid
+        boot_uuid=$(get_uuid "$boot")
+        if [ -n "$boot_uuid" ]; then
+            echo "UUID=$boot_uuid /boot vfat defaults,nofail 0 0" >> "$mp/etc/fstab"
+        else
+            echo "$boot /boot auto defaults,nofail 0 0" >> "$mp/etc/fstab"
+        fi
+    fi
+    if [ -n "$home" ]; then
+        local home_uuid
+        home_uuid=$(get_uuid "$home")
+        if [ -n "$home_uuid" ]; then
+            echo "UUID=$home_uuid /home ext4 defaults,nofail 0 0" >> "$mp/etc/fstab"
+        else
+            echo "$home /home auto defaults,nofail 0 0" >> "$mp/etc/fstab"
+        fi
+    fi
+}
+
+create_dirs() {
+    local mp="$1"
+    for d in proc proc/sysrq-trigger sys dev dev/pts run run/openrc tmp .snapshots \
+             var/lib var/lib/iwd var/log var/cache home; do
+        mkdir -p "$mp/$d"
+    done
+}
+
+fix_permissions() {
+    local mp="$1"
+    echo "Fixing post-install permissions..."
+    if [ -f "$mp/usr/bin/impala" ]; then
+        chmod 4755 "$mp/usr/bin/impala"; echo "Set impala setuid (4755)"
+    fi
+    if [ -f "$mp/usr/libexec/iwd" ]; then
+        chmod 4755 "$mp/usr/libexec/iwd"; echo "Set iwd setuid (4755)"
+    fi
+}
+
+install_bootloader_uefi() {
+    local mp="$1" boot="$2"
+    local esp_mnt="$mp/boot"
+    local esp_mounted=false
+    if ! mountpoint -q "$esp_mnt" 2>/dev/null && [ -n "$boot" ]; then
+        mount "$boot" "$esp_mnt" 2>/dev/null && esp_mounted=true
+    elif mountpoint -q "$esp_mnt" 2>/dev/null; then
+        esp_mounted=true
+    fi
+
+    if [ "$esp_mounted" = false ]; then
+        warn "ESP not accessible, skipping bootloader install"
+        return
+    fi
+
+    echo "Installing UEFI bootloader..."
+    mkdir -p "$esp_mnt/EFI/BOOT"
+    local limine_efi=""
+    for cand in "$mp/usr/share/limine/BOOTX64.EFI" /usr/share/limine/BOOTX64.EFI; do
+        [ -f "$cand" ] && { limine_efi="$cand"; break; }
+    done
+    if [ -z "$limine_efi" ]; then
+        warn "no BOOTX64.EFI found"
+        return
+    fi
+    cp -v "$limine_efi" "$esp_mnt/EFI/BOOT/BOOTX64.EFI" || warn "Failed to copy BOOTX64.EFI"
+
+    local disk part_num
+    if [ -n "$boot" ]; then
+        part_num=$(echo "$boot" | grep -o '[0-9]*$')
+        disk=$(echo "$boot" | sed 's/[0-9]*$//;s/p$//')
+    fi
+    if [ -n "$disk" ] && [ -n "$part_num" ] && command -v efibootmgr >/dev/null 2>&1; then
+        echo "Creating UEFI boot entry..."
+        efibootmgr -c -d "$disk" -p "$part_num" -L "Haliade SYS" -l '\EFI\BOOT\BOOTX64.EFI' 2>&1 || warn "Failed to create UEFI boot entry"
+    fi
+    echo "UEFI bootloader installed."
+}
+
+install_bootloader_bios() {
+    local mp="$1" root="$2"
+    local disk
+    disk=$(echo "$root" | sed 's/[0-9]*$//')
+    disk=$(echo "$disk" | sed 's/p$//')
+    if [ ! -b "$disk" ]; then
+        warn "Could not determine parent disk for $root"
+        return
+    fi
+    if sfdisk -d "$disk" 2>/dev/null | grep -q 'label: gpt'; then
+        echo "Detected GPT partition table."
+        if sfdisk -d "$disk" 2>/dev/null | grep -q 'type=21686148-6449-6E6F-744E-656564454649'; then
+            echo "Installing Limine bootloader to $disk..."
+            "$mp/usr/bin/limine" bios-install "$disk" 2>&1 || warn "limine bios-install failed"
+        else
+            echo "Attempting install with --force..."
+            "$mp/usr/bin/limine" bios-install --force "$disk" 2>&1 || warn "limine bios-install failed"
+        fi
+    else
+        echo "Installing Limine bootloader to $disk..."
+        "$mp/usr/bin/limine" bios-install "$disk" 2>&1 || warn "limine bios-install failed"
+    fi
+}
+
+install_bootloader() {
+    local mp="$1" root="$2" boot="$3"
+    if detect_uefi; then
+        install_bootloader_uefi "$mp" "$boot"
+    else
+        install_bootloader_bios "$mp" "$root"
+    fi
+}
+
+ensure_installed_initramfs() {
+    local mp="$1"
+    echo "Ensuring initramfs present..."
+    if [ ! -s "$mp/boot/initramfs-core.img" ]; then
+        # try copy from host or haliade-root
+        for cand in /boot/initramfs-core.img /home/gretagen/haliade-root/boot/initramfs-core.img; do
+            if [ -s "$cand" ]; then
+                cp -v "$cand" "$mp/boot/initramfs-core.img"
+                break
+            fi
+        done
+    fi
+    if [ ! -s "$mp/boot/initramfs-core.img" ]; then
+        warn "boot/initramfs-core.img not found after bootstrap"
+    fi
+}
+
+verify_boot_files() {
+    local mp="$1" missing=""
+    local boot_dir="$mp/boot"
+    [ -d "$boot_dir" ] || { echo "Error: $boot_dir missing" >&2; return 1; }
+    ls "$boot_dir"/vmlinuz-* >/dev/null 2>&1 || missing="$missing vmlinuz"
+    if ! ls "$boot_dir"/initramfs-*.img >/dev/null 2>&1 && ! ls "$boot_dir"/initrd-* >/dev/null 2>&1; then
+        missing="$missing initramfs"
+    fi
+    [ -f "$boot_dir/limine.conf" ] || missing="$missing limine.conf"
+    if [ -n "$missing" ]; then
+        echo "Error: boot files missing on target:${missing}" >&2
+        ls -la "$boot_dir" >&2 || true
+        return 1
+    fi
+    echo "Verified boot files in $boot_dir:"
+    local f
+    for f in "$boot_dir"/vmlinuz-* "$boot_dir"/initramfs-*.img "$boot_dir"/initrd-* "$boot_dir"/limine.conf; do
+        [ -e "$f" ] && echo "  $(basename "$f")"
+    done
+}
+
+create_initial_generation() {
+    local root="$1" mp="$2"
+    echo "Creating initial generation (gen-1)..."
+    local tl
+    tl=$(mktemp -d /mnt/foundation-gen.XXXXXX)
+    if ! mount -t btrfs -o subvol=/ "$root" "$tl"; then
+        warn "could not mount top-level for initial generation"
+        rmdir "$tl" 2>/dev/null || true
+        return 0
+    fi
+    if [ -d "$tl/@snapshots/gen-1" ]; then
+        btrfs subvolume delete "$tl/@snapshots/gen-1" 2>/dev/null || true
+    fi
+    if btrfs subvolume snapshot -r "$tl/@" "$tl/@snapshots/gen-1"; then
+        local ts
+        ts=$(date +%s)
+        if [ -d "$mp/.snapshots" ]; then
+            cat > "$mp/.snapshots/gen-1.meta.toml" <<EOF
+id = "gen-1"
+timestamp = $ts
+description = "initial installation"
+EOF
+            echo "gen-1" > "$mp/.snapshots/.current"
+        fi
+        echo "Initial generation gen-1 created."
+    else
+        warn "failed to create initial generation"
+    fi
+    umount "$tl" 2>/dev/null || true
+    rmdir "$tl" 2>/dev/null || true
+
+    if [ -x "$mp/usr/bin/chronos" ]; then
+        mount --bind /dev "$mp/dev" 2>/dev/null || true
+        mount --bind /proc "$mp/proc" 2>/dev/null || true
+        mount --bind /sys "$mp/sys" 2>/dev/null || true
+        chroot "$mp" /usr/bin/chronos rewrite-limine 2>/dev/null || warn "chronos rewrite-limine failed"
+        umount "$mp/sys" 2>/dev/null || true
+        umount "$mp/proc" 2>/dev/null || true
+        umount "$mp/dev" 2>/dev/null || true
+    fi
+}
+
+run_chronos_rewrite() {
+    local mp="$1"
+    mount --bind /dev "$mp/dev" 2>/dev/null || true
+    mount --bind /proc "$mp/proc" 2>/dev/null || true
+    mount --bind /sys "$mp/sys" 2>/dev/null || true
+    if [ -x "$mp/usr/bin/chronos" ]; then
+        chroot "$mp" /usr/bin/chronos rewrite-limine || warn "chronos rewrite-limine failed"
+    else
+        warn "chronos not found in deployed system"
+    fi
+    umount "$mp/sys" 2>/dev/null || true
+    umount "$mp/proc" 2>/dev/null || true
+    umount "$mp/dev" 2>/dev/null || true
+}
+
+# subcommands
+
+cmd_place() {
+    parse_place "$@"
+    local root="${POSITIONAL[0]:-}" boot="${POSITIONAL[1]:-}" home="${POSITIONAL[2]:-}"
+    [ -n "$root" ] || { usage; exit 1; }
+    check_root
+    validate_device "$root" "root"
+    [ -n "$boot" ] && validate_device "$boot" "boot"
+    [ -n "$home" ] && validate_device "$home" "home"
+
+    if [ "$PASS" != true ]; then
+        read -rp "Bootstrap this Haliade system? this will wipe the whole drive, this action cannot be undone. [Y/n] : " choice
+        case "$choice" in
+            [Yy]) ;;
+            *) echo "Cancelled."; exit 0 ;;
+        esac
+    fi
+
+    local mp="/mnt/target"
+    trap 'cleanup_mounts "$mp" "$boot" "$home"' EXIT
+    mount_target "$root" "$boot" "$home" "$mp"
+
+    # bootstrap base with ZETA
+    local zb
+    zb=$(zeta_bin) || die "zeta not found"
+    echo "Bootstrapping base with ZETA..."
+    ZETA_ROOT="$mp" "$zb" -provide base --pass --silence || die "zeta -provide base failed"
+
+    # kernel (best effort)
+    if ! ls "$mp"/boot/vmlinuz-* >/dev/null 2>&1; then
+        echo "Installing kernel via ZETA (linux-bin)..."
+        ZETA_ROOT="$mp" "$zb" -provide linux-bin --pass --silence 2>/dev/null || true
+    fi
+    # fallback: copy kernel/initramfs from host live system if still missing
+    if ! ls "$mp"/boot/vmlinuz-* >/dev/null 2>&1; then
+        for cand in /boot/vmlinuz-* /home/gretagen/haliade-root/boot/vmlinuz-*; do
+            [ -e "$cand" ] && { cp -v $cand "$mp/boot/" 2>/dev/null || true; }
+        done
+    fi
+    ensure_installed_initramfs "$mp"
+
+    create_dirs "$mp"
+    fix_permissions "$mp"
+    update_boot_config "$root" "$boot" "$mp"
+    generate_fstab "$root" "$boot" "$home" "$mp"
+    install_bootloader "$mp" "$root" "$boot"
+
+    # reproducibility: enable generators / install generators files
+    if [ -n "$SYSTEM_GENERATORS_FILE" ]; then
+        mkdir -p "$mp/etc/nacelle"
+        cp -v "$SYSTEM_GENERATORS_FILE" "$mp/etc/nacelle/enabled_system_generators.lua"
+    fi
+    if [ -n "$HOUSE_GENERATORS_FILE" ]; then
+        mkdir -p "$mp/etc/nacelle/houses"
+        cp -v "$HOUSE_GENERATORS_FILE" "$mp/etc/nacelle/houses/enabled_house_generators.lua"
+    fi
+    if [ -x "$mp/usr/bin/nacelle" ]; then
+        for g in "${ENABLE_GENERATORS[@]+"${ENABLE_GENERATORS[@]}"}"; do
+            [ -n "$g" ] || continue
+            chroot "$mp" /usr/bin/nacelle enable-generator system "$g" || warn "enable-generator failed: $g"
+        done
+        for g in "${HOUSE_GENERATORS[@]+"${HOUSE_GENERATORS[@]}"}"; do
+            [ -n "$g" ] || continue
+            chroot "$mp" /usr/bin/nacelle enable-generator house "$g" || warn "enable-generator failed: $g"
+        done
+    else
+        [ ${#ENABLE_GENERATORS[@]} -eq 0 ] && [ ${#HOUSE_GENERATORS[@]} -eq 0 ] || warn "nacelle not found in deployed system; skipping generator enable"
+    fi
+
+    run_chronos_rewrite "$mp"
+
+    if [ -n "$INIT" ]; then
+        echo "Installing init: $INIT"
+        chroot "$mp" /usr/bin/iniswap --pass "$INIT" || warn "iniswap failed"
+    fi
+
+    if [ -n "$CONFIG" ]; then
+        echo "Synchronizing Nacelle config: $CONFIG"
+        mkdir -p "$mp/etc/nacelle"
+        if [ -f "$CONFIG" ]; then
+            cp "$CONFIG" "$mp/etc/nacelle/definition.lua"
+        else
+            warn "config file not found: $CONFIG"
+        fi
+        printf 'y\n' | chroot "$mp" /usr/bin/nacelle spin system || warn "nacelle sync failed"
+    else
+        if [ -d /etc/nacelle ]; then
+            echo "Copying /etc/nacelle from host system..."
+            rm -rf "$mp/etc/nacelle"
+            mkdir -p "$mp/etc"
+            cp -a /etc/nacelle "$mp/etc/" || warn "failed to copy /etc/nacelle"
+            if [ -x "$mp/usr/bin/nacelle" ]; then
+                printf 'y\n' | chroot "$mp" /usr/bin/nacelle spin system || warn "nacelle sync failed"
+            fi
+        else
+            warn "/etc/nacelle not found on host; skipping default config copy"
+        fi
+    fi
+
+    verify_boot_files "$mp" || warn "boot file verification failed"
+
+    echo "The Haliade system has been successfully bootstrapped and installed."
+}
+
+cmd_clone() {
+    parse_clone "$@"
+    local root="${POSITIONAL[0]:-}" boot="${POSITIONAL[1]:-}" home="${POSITIONAL[2]:-}"
+    [ -n "$root" ] || { usage; exit 1; }
+    check_root
+    validate_device "$root" "root"
+    [ -n "$boot" ] && validate_device "$boot" "boot"
+    [ -n "$home" ] && validate_device "$home" "home"
+
+    read -rp "Clone this Haliade system? this will wipe the whole drive, and this action cannot be undone. [y/N] : " choice
+    case "${choice:-Y}" in
+        [Yy]) ;;
+        *) echo "Cancelled."; exit 0 ;;
+    esac
+
+    local mp="/mnt/target"
+    trap 'cleanup_mounts "$mp" "$boot" "$home"' EXIT
+    mount_target "$root" "$boot" "$home" "$mp"
+
+    purge_live_only
+    copy_rootfs
+    create_dirs "$mp"
+    # reproducibility: copy host /etc/nacelle when no explicit config (clone has no --config)
+    if [ -d /etc/nacelle ]; then
+        echo "Copying /etc/nacelle from host system..."
+        rm -rf "$mp/etc/nacelle"
+        mkdir -p "$mp/etc"
+        cp -a /etc/nacelle "$mp/etc/" || warn "failed to copy /etc/nacelle"
+    fi
+    fix_permissions "$mp"
+    update_boot_config "$root" "$boot" "$mp"
+    verify_no_live_only
+    verify_boot_files "$mp"
+    generate_fstab "$root" "$boot" "$home" "$mp"
+    install_bootloader "$mp" "$root" "$boot"
+    create_initial_generation "$root" "$mp"
+
+    echo "The Haliade system has been successfully cloned and installed."
+}
+
+cmd_deploy() {
+    local dir="${1:-}"
+    [ -n "$dir" ] || die "missing directory (usage: tower deploy <dir>)"
+    mkdir -p "$dir"
+    local zb
+    zb=$(zeta_bin) || die "zeta not found"
+    echo "Deploying Haliade root filesystem tree at $dir..."
+    ZETA_ROOT="$dir" "$zb" -provide base
+    echo "Deployed. You can chroot with: tower climb $dir"
+    echo "Build an ISO with: tower rebuild $dir"
+}
+
+cmd_rebuild() {
+    local dir="${1:-}"
+    [ -n "$dir" ] || die "missing directory (usage: tower rebuild <dir>)"
+    [ -d "$dir" ] || die "directory not found: $dir"
+
+    # auto-detect kernel
+    local vmlinuz
+    vmlinuz=$(ls -t "$dir"/boot/vmlinuz-* 2>/dev/null | sort -V | tail -1)
+    [ -n "$vmlinuz" ] || die "no kernel found in $dir/boot/vmlinuz-*"
+    local vmlinuz_name
+    vmlinuz_name=$(basename "$vmlinuz")
+    echo "Using kernel: $vmlinuz_name"
+
+    # auto-detect initramfs (installed)
+    local initrd_name="initramfs-core.img"
+    if [ ! -f "$dir/boot/$initrd_name" ]; then
+        local cand
+        cand=$(ls "$dir"/boot/initramfs-*.img 2>/dev/null | sort -V | tail -1)
+        [ -n "$cand" ] && initrd_name=$(basename "$cand")
+    fi
+
+    local rootfs="$dir"
+    local output_dir="${FOUNDATION_ISO_DIR:-/home/gretagen/Documents/isos}"
+    mkdir -p "$output_dir"
+    local date
+    date=$(date +%Y%m%d)
+    local output="$output_dir/haliadesys-$date.iso"
+    local iso_root
+    iso_root=$(mktemp -d /tmp/iso_root.XXXXXX)
+
+    # checks
+    for cmd in mksquashfs cpio xorriso; do
+        command -v "$cmd" >/dev/null 2>&1 || die "required command '$cmd' not found"
+    done
+    local limine="$dir/usr/bin/limine"
+    [ -x "$limine" ] || die "limine binary not found at $limine"
+
+    # extra cmdline from definition.lua
+    local extra_cmdline=""
+    if [ -f "$dir/etc/haliade/definition.lua" ]; then
+        extra_cmdline=$(sed -n 's/.*kernel_cmdline[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/etc/haliade/definition.lua" | head -1)
+    fi
+
+    local timeout=15
+    if [ -f "$dir/boot/limine.conf" ]; then
+        timeout=$(grep -m1 '^timeout:' "$dir/boot/limine.conf" 2>/dev/null | grep -oP '\d+' || echo "15")
+    fi
+
+    echo "Building rootfs.squashfs..."
+    rm -f /tmp/rootfs.squashfs
+    cat > /tmp/squashfs-excludes << 'EOFEX'
+dev/
+proc/
+sys/
+run/
+tmp/
+lost+found
+nix/
+usr/lib/go/
+boot/efi.img
+boot/BOOTX64.EFI
+boot/limine-bios-cd.bin
+boot/limine-uefi-cd.bin
+boot/limine-bios.sys
+usr/lib/firmware/qcom/
+usr/lib/firmware/mellanox/
+usr/lib/firmware/qed/
+usr/lib/firmware/netronome/
+usr/lib/firmware/dpaa2/
+usr/lib/firmware/ti-connectivity/
+usr/lib/firmware/radeon/
+EOFEX
+    if [ -d "$dir/usr/lib" ]; then
+        find "$dir/usr/lib" -name '*.a' -printf 'usr/lib/%P\n' >> /tmp/squashfs-excludes 2>/dev/null || true
+        find "$dir/usr/lib" -name '*.la' -printf 'usr/lib/%P\n' >> /tmp/squashfs-excludes 2>/dev/null || true
+    fi
+
+    mksquashfs "$dir" /tmp/rootfs.squashfs -comp zstd -Xcompression-level 15 \
+        -force-uid 0 -force-gid 0 -ef /tmp/squashfs-excludes
+
+    echo "Building live initramfs..."
+    rm -rf /tmp/initramfs-live
+    mkdir -p /tmp/initramfs-live/bin /tmp/initramfs-live/lib64 /tmp/initramfs-live/dev /tmp/initramfs-live/proc /tmp/initramfs-live/sys /tmp/initramfs-live/run /tmp/initramfs-live/sbin
+    cp "$dir"/usr/bin/busybox /tmp/initramfs-live/bin/ 2>/dev/null || true
+    for applet in sh mount umount switch_root mkdir losetup cat sleep echo mknod ln grep sed ls modprobe blkid fsck touch chmod reboot halt poweroff; do
+        ln -sf /bin/busybox /tmp/initramfs-live/bin/$applet 2>/dev/null || true
+    done
+    ln -sf /bin/busybox /tmp/initramfs-live/sbin/modprobe 2>/dev/null || true
+    mkdir -p /tmp/initramfs-live/lib64
+    for lib in ld-linux-x86-64.so.2 libc.so.6 libm.so.6 libresolv.so.2; do
+        [ -f "$dir/usr/lib64/$lib" ] && cp "$dir/usr/lib64/$lib" /tmp/initramfs-live/lib64/
+    done
+    for fw in nvidia i915 xe amdgpu; do
+        if [ -d "$dir/usr/lib/firmware/$fw" ]; then
+            mkdir -p /tmp/initramfs-live/lib/firmware
+            cp -r "$dir/usr/lib/firmware/$fw" /tmp/initramfs-live/lib/firmware/
+        fi
+    done
+
+    cat > /tmp/initramfs-live/init << 'INITEOF'
+#!/bin/sh
+export PATH=/bin:/sbin
+console=/dev/console
+say() { echo "$@" >$console 2>&1; }
+die() { say "FATAL: $@"; sleep 5; echo b > /proc/sysrq-trigger; }
+
+mkdir -p /proc /sys /dev /run
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev
+mount -t tmpfs tmpfs /run
+
+if [ ! -c /dev/loop0 ]; then
+    for i in 0 1 2 3 4 5 6 7; do
+        mknod /dev/loop$i b 7 $i 2>/dev/null
+    done
+fi
+if [ ! -c /dev/loop-control ]; then
+    mknod /dev/loop-control c 10 237 2>/dev/null
+fi
+
+modprobe loop 2>/dev/null
+modprobe usb-storage 2>/dev/null
+modprobe sd_mod 2>/dev/null
+modprobe sr_mod 2>/dev/null
+modprobe isofs 2>/dev/null
+modprobe squashfs 2>/dev/null
+
+ISO_MNT=/mnt/iso
+mkdir -p $ISO_MNT
+ISO_DEV=""
+
+KCMDLINE=$(cat /proc/cmdline 2>/dev/null || true)
+
+find_parts() {
+    for dev in /sys/block/*/; do
+        devname="${dev#/sys/block/}"
+        devname="${devname%/}"
+        case "$devname" in loop*|ram*|dm-*|md*|nbd*) continue ;; esac
+        if [ -b "/dev/$devname" ]; then echo "/dev/$devname"; fi
+    done
+    for dev in /sys/block/*/; do
+        devname="${dev#/sys/block/}"
+        devname="${devname%/}"
+        case "$devname" in loop*|ram*|dm-*|md*|nbd*) continue ;; esac
+        for part in "$dev"*/partition; do
+            [ -f "$part" ] || continue
+            partname="${part#/sys/block/}"
+            partname="${partname%/partition}"
+            echo "/dev/$partname"
+        done
+    done
+}
+
+try_mount_iso() {
+    [ -b "$1" ] || return 1
+    say "Trying $1..."
+    mount -t iso9660 -o ro "$1" $ISO_MNT 2>/dev/null || return 1
+    if [ -f "$ISO_MNT/boot/rootfs.squashfs" ]; then
+        ISO_DEV="$1"
+        return 0
+    fi
+    umount $ISO_MNT 2>/dev/null || true
+    return 1
+}
+
+say "probing your peripherals..."
+attempts=0
+while [ $attempts -lt 30 ]; do
+    parts=$(find_parts)
+    [ -n "$parts" ] && break
+    sleep 0.5
+    attempts=$((attempts + 1))
+done
+
+for devpath in $parts; do
+    try_mount_iso "$devpath" && break
+done
+
+if [ -z "$ISO_DEV" ]; then
+    say "Retrying in 5s..."
+    sleep 5
+    parts=$(find_parts)
+    for devpath in $parts; do
+        try_mount_iso "$devpath" && break
+    done
+fi
+
+if [ -z "$ISO_DEV" ]; then
+    die "No bootable media found"
+fi
+
+say "Found ISO on $ISO_DEV"
+
+mkdir -p /tmp/live/root /tmp/live/upper /tmp/live/work /tmp/live/sysroot
+mount -t squashfs -o ro,loop $ISO_MNT/boot/rootfs.squashfs /tmp/live/root || die "Cannot mount squashfs"
+say "Squashfs mounted OK"
+
+mount -t tmpfs -o rw,noatime,mode=755,size=50% none /tmp/live/upper
+mkdir -p /tmp/live/upper/work /tmp/live/upper/root
+mount -t overlay -o lowerdir=/tmp/live/root,upperdir=/tmp/live/upper/root,workdir=/tmp/live/upper/work none /tmp/live/sysroot || die "Cannot mount overlay"
+say "Overlay mounted OK"
+
+for d in proc sys dev run tmp; do mkdir -p /tmp/live/sysroot/$d; done
+mount --move /proc /tmp/live/sysroot/proc
+mount --move /sys /tmp/live/sysroot/sys
+mount --move /dev /tmp/live/sysroot/dev
+mount -t tmpfs tmpfs /tmp/live/sysroot/run
+mount -t tmpfs tmpfs /tmp/live/sysroot/tmp
+
+[ -c /tmp/live/sysroot/dev/console ] || die "No /dev/console in sysroot"
+[ -f /tmp/live/sysroot/sbin/init ] || die "No /sbin/init in sysroot"
+
+touch /tmp/live/sysroot/fastboot
+
+# no boot animation: boot straight to openrc-init
+INIT=/sbin/openrc-init
+if [ ! -x "/tmp/live/sysroot$INIT" ]; then
+    INIT=/sbin/init
+fi
+exec switch_root /tmp/live/sysroot "$INIT"
+INITEOF
+    chmod +x /tmp/initramfs-live/init
+
+    rm -f /tmp/initramfs-live.img
+    (cd /tmp/initramfs-live && find . -print0 | cpio -o --format=newc --owner root:root --null > /tmp/initramfs-live.img 2>/dev/null)
+    echo "Initramfs size: $(du -h /tmp/initramfs-live.img | cut -f1)"
+
+    echo "Assembling ISO tree..."
+    rm -rf "$iso_root"
+    mkdir -p "$iso_root/boot" "$iso_root/EFI/BOOT"
+
+    cp /tmp/rootfs.squashfs "$iso_root/boot/rootfs.squashfs"
+    cp "$vmlinuz" "$iso_root/boot/"
+    cp /tmp/initramfs-live.img "$iso_root/boot/initramfs-live.img"
+    [ -f "$dir/boot/image.png" ] && cp "$dir/boot/image.png" "$iso_root/boot/" 2>/dev/null || true
+    [ -f "$dir/usr/share/limine/limine-bios-cd.bin" ] && cp "$dir/usr/share/limine/limine-bios-cd.bin" "$iso_root/" 2>/dev/null || true
+    [ -f "$dir/usr/share/limine/limine-uefi-cd.bin" ] && cp "$dir/usr/share/limine/limine-uefi-cd.bin" "$iso_root/" 2>/dev/null || true
+    [ -f "$dir/usr/share/limine/limine-bios.sys" ] && cp "$dir/usr/share/limine/limine-bios.sys" "$iso_root/boot/" 2>/dev/null || true
+    [ -f "$dir/usr/share/limine/BOOTX64.EFI" ] && cp "$dir/usr/share/limine/BOOTX64.EFI" "$iso_root/EFI/BOOT/" 2>/dev/null || true
+
+    cat > "$iso_root/boot/limine.conf" << CONFEOF
+# Limine configuration for Haliade system Live ISO
+
+timeout: $timeout
+serial: yes
+
+/HaliadeSYS live-env
+    protocol: linux
+    kernel_path: boot():/boot/$vmlinuz_name
+    module_path: boot():/boot/initramfs-live.img
+    cmdline: console=tty0 loglevel=7 $extra_cmdline
+CONFEOF
+
+    echo "Creating ISO..."
+    xorriso -as mkisofs -R -J -V HALIADE_SYS -b limine-bios-cd.bin -no-emul-boot \
+        -boot-load-size 4 -boot-info-table --efi-boot limine-uefi-cd.bin \
+        -efi-boot-part --efi-boot-image --protective-msdos-label "$iso_root" \
+        -o "$output" 2>&1 | tail -3
+
+    if [ -x "$limine" ]; then
+        echo "Installing Limine BIOS boot..."
+        "$limine" bios-install "$output" 2>&1 || warn "limine bios-install failed"
+    fi
+
+    rm -rf "$iso_root" /tmp/rootfs.squashfs /tmp/initramfs-live /tmp/initramfs-live.img /tmp/squashfs-excludes
+
+    echo ""
+    echo "ISO built successfully."
+    echo "Location: $output"
+    echo "Size: $(du -h "$output" | cut -f1)"
+}
+
+cmd_enable_generators() {
+    local dir="${1:-}"; shift || true
+    [ -n "$dir" ] || die "missing directory (usage: tower enable-generators <dir> [system|house] <name...>)"
+    [ -d "$dir" ] || die "directory not found: $dir"
+
+    local cat="system"
+    if [ "${1:-}" = "system" ] || [ "${1:-}" = "house" ]; then
+        cat="$1"; shift
+    fi
+    [ $# -gt 0 ] || die "missing generator name(s)"
+
+    if [ ! -x "$dir/usr/bin/nacelle" ]; then
+        die "nacelle not found in $dir (deploy base first)"
+    fi
+
+    for name in "$@"; do
+        chroot "$dir" /usr/bin/nacelle enable-generator "$cat" "$name" || warn "enable-generator failed: $name"
+    done
+}
+
+cmd_climb() {
+    local dir="${1:-}"
+    [ -n "$dir" ] || die "missing directory (usage: tower climb <dir> [shell])"
+    [ -d "$dir" ] || die "directory not found: $dir"
+
+    local shell="${2:-}"
+    if [ -z "$shell" ]; then
+        for sh in /bin/bash /bin/sh /usr/bin/bash /usr/bin/sh /sbin/sh /bin/ash /usr/bin/ash; do
+            if [ -L "$dir/$sh" ] || [ -x "$dir/$sh" ]; then
+                shell="$sh"
+                break
+            fi
+        done
+    fi
+    if [ -z "$shell" ]; then
+        for cand in "$dir"/nix/store/*-bash-*/bin/bash "$dir"/nix/store/*-bash-*/bin/sh; do
+            if [ -x "$cand" ]; then
+                shell="${cand#"$dir"}"
+                break
+            fi
+        done
+    fi
+    [ -n "$shell" ] || die "No shell found in $dir"
+
+    command -v bwrap >/dev/null 2>&1 || die "bubblewrap (bwrap) not found"
+
+    local run_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    if [ -L "$dir/nix/var/nix/profiles/system" ]; then
+        run_path="/nix/var/nix/profiles/system/sw/bin:/nix/var/nix/profiles/default/bin:/root/.nix-profile/bin:$run_path"
+    fi
+
+    local bwrap_args=(
+        --bind "$dir" /
+        --dev-bind /dev /dev
+        --proc /proc
+        --ro-bind /sys /sys
+        --tmpfs /tmp
+        --tmpfs /dev/shm
+        --setenv HOME /root
+        --setenv PATH "$run_path"
+        --unshare-ipc
+        --unshare-pid
+        --unshare-uts
+        --die-with-parent
+    )
+
+    if [ -f "$dir/etc/resolv.conf" ]; then
+        bwrap_args+=(--ro-bind /etc/resolv.conf /etc/resolv.conf)
+    fi
+
+    # X11
+    if [ -n "${DISPLAY:-}" ]; then
+        bwrap_args+=(--setenv DISPLAY "$DISPLAY")
+        local xauth_file=""
+        if [ -n "${XAUTHORITY:-}" ] && [ -f "$XAUTHORITY" ]; then
+            xauth_file="$XAUTHORITY"
+        elif [ -f "${HOME:-}/.Xauthority" ]; then
+            xauth_file="${HOME}/.Xauthority"
+        fi
+        if [ -n "$xauth_file" ]; then
+            bwrap_args+=(--ro-bind "$xauth_file" /root/.Xauthority)
+            bwrap_args+=(--setenv XAUTHORITY /root/.Xauthority)
+        fi
+    fi
+
+    # Wayland
+    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        local xdg="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        local ws="$xdg/$WAYLAND_DISPLAY"
+        if [ -S "$ws" ]; then
+            bwrap_args+=(--ro-bind "$ws" "$ws")
+            bwrap_args+=(--setenv WAYLAND_DISPLAY "$WAYLAND_DISPLAY")
+            bwrap_args+=(--setenv XDG_RUNTIME_DIR "$xdg")
+        fi
+    fi
+
+    # D-Bus
+    local xdg="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    if [ -S "$xdg/bus" ]; then
+        bwrap_args+=(--ro-bind "$xdg/bus" "$xdg/bus")
+        bwrap_args+=(--setenv DBUS_SESSION_BUS_ADDRESS "unix:path=$xdg/bus")
+    fi
+
+    exec bwrap "${bwrap_args[@]}" "$shell"
+}
+
+# dispatch 
+
+if [ $# -eq 0 ]; then
+    usage
+fi
+
+case "$1" in
+    place)
+        shift
+        cmd_place "$@"
+        ;;
+    clone)
+        shift
+        cmd_clone "$@"
+        ;;
+    deploy)
+        shift
+        cmd_deploy "$@"
+        ;;
+    rebuild)
+        shift
+        cmd_rebuild "$@"
+        ;;
+    enable-generators)
+        shift
+        cmd_enable_generators "$@"
+        ;;
+    climb)
+        shift
+        cmd_climb "$@"
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        echo "error: unknown command: $1" >&2
+        usage
+        ;;
+esac
