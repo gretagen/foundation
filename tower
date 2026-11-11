@@ -18,26 +18,30 @@ foundation | Haliade system deployment tool
 "Every wind turbine needs a tower."
 
 Usage:
-  tower place  [--uefi|--bios] [root] [boot] [home] [--pass] [--init NAME] [--config PATH]
-               [--enable-generator NAME] [--enable-house-generator NAME]
+  tower place  [--uefi|--bios] [root] [boot] [home] [--pass] [--init NAME] [--shell NAME]
+               [--config PATH] [--enable-generator NAME] [--enable-house-generator NAME]
                [--system-generators-file PATH] [--house-generators-file PATH]
   tower clone  [--uefi|--bios] [root] [boot] [home]
-  tower deploy <dir>
+  tower deploy <dir> [--pass] [--shell NAME] [--config PATH]
+               [--enable-generator NAME] [--enable-house-generator NAME]
+               [--system-generators-file PATH] [--house-generators-file PATH]
   tower rebuild <dir>
   tower climb  <dir> [shell]
   tower enable-generators <dir> [system|house] <name...>
   tower help
 
 Subcommands:
-  place    Bootstrap a Haliade system onto a drive 
+  place    Bootstrap a Haliade system onto a drive
   clone    copy the whole live / into a partition.
   deploy   Deploy an Haliade root filesystem tree somewhere.
-  rebuild  Build a bootable ISO from a Haliade root filesystem tree 
-  climb    Enter a root filesystem tree
+  rebuild  Build a bootable ISO from a root filesystem tree
+  climb    Enter a root filesystem tree (default shell: the tree root's
+           login shell, else thesh)
 
-Flags (place only):
+Flags (place and deploy):
   --pass                  Do not ask for confirmation to bootstrap.
-  --init NAME             Install an init of the user's choice
+  --shell NAME            Default root shell written into the tree's
+                          /etc/passwd (default: thesh).
   --config PATH           Synchronize a Nacelle config into the deployed system.
   --enable-generator NAME Enable a system generator (repeatable).
   --enable-house-generator NAME
@@ -46,6 +50,9 @@ Flags (place only):
                           Copy a system generators file into the deployed system.
   --house-generators-file PATH
                           Copy a house generators file into the deployed system.
+
+Flags (place only):
+  --init NAME             Install an init of the user's choice
   --uefi/--bios           Force bootloader mode.
 EOF
     exit 0
@@ -82,16 +89,80 @@ UEFI_OVERRIDE=""
 PASS=false
 INIT=""
 CONFIG=""
+ROOT_SHELL=""
 POSITIONAL=()
 ENABLE_GENERATORS=()
 HOUSE_GENERATORS=()
 SYSTEM_GENERATORS_FILE=""
 HOUSE_GENERATORS_FILE=""
+# usr-merge: the host installs through /bin -> usr/bin, /lib -> usr/lib,
+# /lib64 -> usr/lib64, /sbin -> usr/sbin symlinks while packages ship a
+# mix of bin/ and usr/bin/ paths. A fresh tree without the symlinks ends
+# up split — and every #!/bin/bash script (zeta, subspace-cli, ...) dies
+# with "No such file or directory" inside climb/chroot. Called before AND
+# after zeta provides (before: files land merged like on the host; after:
+# repairs trees that predate this logic or where commit recreated dirs).
+ensure_merge() {
+    local dir="$1" d t
+    for d in bin sbin lib lib64; do
+        t="usr/$d"
+        [ -L "$dir/$d" ] && continue
+        mkdir -p "$dir/$t"
+        if [ -d "$dir/$d" ]; then
+            # existing real dir (pre-merge tree): move contents up.
+            # Overwrite wins — matches host last-writer semantics (the
+            # host ends with /bin/sh -> busybox, not bash, the same way).
+            ( shopt -s dotglob nullglob
+              files=("$dir/$d"/*)
+              [ ${#files[@]} -eq 0 ] || mv -f "${files[@]}" "$dir/$t/" || true )
+            rmdir "$dir/$d" 2>/dev/null || { warn "could not fully migrate $dir/$d (left in place)"; continue; }
+        fi
+        ln -s "$t" "$dir/$d"
+    done
+}
+
+# Default root shell: keep/create root's entry in the tree's /etc/passwd
+# (deployed trees ship no /etc/passwd at all), defaulting to thesh — the
+# host convention. A bare name becomes /bin/<name> (valid once merged).
+set_root_shell() {
+    local dir="$1" shell="${2:-thesh}"
+    case "$shell" in
+        /*) ;;
+        *) shell="/bin/$shell" ;;
+    esac
+    mkdir -p "$dir/etc" "$dir/root"
+    if [ -f "$dir/etc/passwd" ]; then
+        local tmp
+        tmp=$(mktemp)
+        awk -F: -v OFS=: -v sh="$shell" '$1=="root"{$7=sh} {print}' "$dir/etc/passwd" > "$tmp" \
+            && cat "$tmp" > "$dir/etc/passwd"
+        rm -f "$tmp"
+        grep -q '^root:' "$dir/etc/passwd" || printf 'root:x:0:0:root:/root:%s\n' "$shell" >> "$dir/etc/passwd"
+    else
+        printf 'root:x:0:0:root:/root:%s\n' "$shell" > "$dir/etc/passwd"
+    fi
+    info "root shell in $dir/etc/passwd -> $shell"
+}
+
+# thesh system config from the host (thesh ships without any config; the
+# host's lives at /etc/theshrc + /etc/thesh/presets).
+copy_thesh_config() {
+    local dir="$1"
+    mkdir -p "$dir/etc"
+    [ -e /etc/theshrc ] && cp -a /etc/theshrc "$dir/etc/theshrc"
+    if [ -d /etc/thesh ]; then
+        rm -rf "$dir/etc/thesh"
+        cp -a /etc/thesh "$dir/etc/thesh"
+    fi
+    return 0
+}
+
 parse_place() {
     UEFI_OVERRIDE=""
     PASS=false
     INIT=""
     CONFIG=""
+    ROOT_SHELL=""
     ENABLE_GENERATORS=()
     HOUSE_GENERATORS=()
     SYSTEM_GENERATORS_FILE=""
@@ -104,6 +175,7 @@ parse_place() {
             --pass) PASS=true; shift ;;
             --init) INIT="${2:-}"; shift 2 ;;
             --config) CONFIG="${2:-}"; shift 2 ;;
+            --shell) ROOT_SHELL="${2:-}"; shift 2 ;;
             --enable-generator) ENABLE_GENERATORS+=("${2:-}"); shift 2 ;;
             --enable-house-generator) HOUSE_GENERATORS+=("${2:-}"); shift 2 ;;
             --system-generators-file) SYSTEM_GENERATORS_FILE="${2:-}"; shift 2 ;;
@@ -565,7 +637,13 @@ cmd_place() {
     local zb
     zb=$(zeta_bin) || die "zeta not found"
     echo "Bootstrapping base with ZETA..."
+    ensure_merge "$mp"
     ZETA_ROOT="$mp" "$zb" -provide base --pass --silence || die "zeta -provide base failed"
+    # tree identity (see cmd_deploy): merge repair, host thesh config,
+    # default root shell from --shell (default thesh).
+    ensure_merge "$mp"
+    copy_thesh_config "$mp"
+    set_root_shell "$mp" "${ROOT_SHELL:-thesh}"
 
     # kernel (best effort)
     if ! ls "$mp"/boot/vmlinuz-* >/dev/null 2>&1; then
@@ -687,6 +765,7 @@ cmd_deploy() {
     local dir=""
     local pass=false
     local config=""
+    local shell=""
     local -a enable_gens=()
     local -a enable_house=()
     local sys_gen_file=""
@@ -695,6 +774,7 @@ cmd_deploy() {
         case "$1" in
             --pass) pass=true; shift ;;
             --config) config="${2:-}"; shift 2 ;;
+            --shell) shell="${2:-}"; shift 2 ;;
             --enable-generator) enable_gens+=("${2:-}"); shift 2 ;;
             --enable-house-generator) enable_house+=("${2:-}"); shift 2 ;;
             --system-generators-file) sys_gen_file="${2:-}"; shift 2 ;;
@@ -712,11 +792,25 @@ cmd_deploy() {
     local zb
     zb=$(zeta_bin) || die "zeta not found"
     echo "Deploying Haliade root filesystem tree at $dir..."
+
+    # Merged /usr layout FIRST so package files land exactly like the host
+    # (and #!/bin/bash shebangs resolve inside climb/chroot).
+    ensure_merge "$dir"
+    # Re-runs must HEAL an existing tree: -provide on an already-provided
+    # package is only a warning, so its hooks (rooted ldconfig!) never re-run.
+    local prov="-provide"
+    [ -d "$dir/var/db/zeta" ] && prov="-ReProvide"
     if [ "$pass" = true ]; then
-        ZETA_ROOT="$dir" "$zb" -provide base --pass
+        ZETA_ROOT="$dir" "$zb" "$prov" base --pass
     else
-        ZETA_ROOT="$dir" "$zb" -provide base
+        ZETA_ROOT="$dir" "$zb" "$prov" base
     fi
+
+    # Tree identity: repair the merge in case commit recreated real dirs,
+    # then give the tree the host's thesh config and default root shell.
+    ensure_merge "$dir"
+    copy_thesh_config "$dir"
+    set_root_shell "$dir" "${shell:-thesh}"
 
     # reproducibility steps
     if [ -n "$sys_gen_file" ]; then
@@ -1072,8 +1166,21 @@ cmd_climb() {
     [ -d "$dir" ] || die "directory not found: $dir"
 
     local shell="${2:-}"
+    local pshell="" r_name r_pass r_uid r_gid r_gecos r_home r_shell
+    #1: root's configured login shell from the tree's passwd — the same
+    # value tower deploy/place write via --shell.
+    if [ -z "$shell" ] && [ -f "$dir/etc/passwd" ]; then
+        while IFS=: read -r r_name r_pass r_uid r_gid r_gecos r_home r_shell; do
+            if [ "$r_name" = "root" ]; then pshell="$r_shell"; break; fi
+        done < "$dir/etc/passwd"
+        if [ -n "$pshell" ] && { [ -L "$dir$pshell" ] || [ -x "$dir$pshell" ]; }; then
+            shell="$pshell"
+        fi
+    fi
+    #2: thesh first — the distro's default shell (covers trees without a
+    # passwd yet), then the historic candidates.
     if [ -z "$shell" ]; then
-        for sh in /bin/bash /bin/sh /usr/bin/bash /usr/bin/sh /sbin/sh /bin/ash /usr/bin/ash; do
+        for sh in /usr/bin/thesh /bin/thesh /bin/bash /bin/sh /usr/bin/bash /usr/bin/sh /sbin/sh /bin/ash /usr/bin/ash; do
             if [ -L "$dir/$sh" ] || [ -x "$dir/$sh" ]; then
                 shell="$sh"
                 break
