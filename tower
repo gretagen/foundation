@@ -429,7 +429,7 @@ FSTAB
 
 create_dirs() {
     local mp="$1"
-    for d in proc proc/sysrq-trigger sys dev dev/pts run run/openrc tmp .snapshots \
+    for d in proc proc/sysrq-trigger sys dev dev/pts dev/shm run run/openrc tmp .snapshots \
              var/lib var/lib/iwd var/log var/cache home; do
         mkdir -p "$mp/$d"
     done
@@ -808,6 +808,12 @@ cmd_deploy() {
     else
         ZETA_ROOT="$dir" "$zb" "$prov" base
     fi
+
+    # Root skeleton: proc/sys/dev/pts/dev/shm/run/tmp/var/home. place has
+    # always done this; deploy trees had none — and climb (unprivileged
+    # bwrap) cannot mkdir mountpoints into a root-owned tree, so every
+    # --proc/--dev-bind/--tmpfs in climb died with "Permission denied".
+    create_dirs "$dir"
 
     # Tree identity: repair the merge in case commit recreated real dirs,
     # then give the tree the host's thesh config and default root shell.
