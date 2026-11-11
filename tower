@@ -884,22 +884,18 @@ cmd_rebuild() {
     # auto-detect kernel
     local vmlinuz
     vmlinuz=$(ls -t "$dir"/boot/vmlinuz-* 2>/dev/null | sort -V | tail -1)
-    [ -n "$vmlinuz" ] || die "no kernel found in $dir/boot/vmlinuz-*"
+    [ -n "$vmlinuz" ] || die "Cannot build an ISO of this tree, Are you sure there is a kernel installed inside?"
     local vmlinuz_name
     vmlinuz_name=$(basename "$vmlinuz")
     echo "Using kernel: $vmlinuz_name"
 
-    # auto-detect initramfs (installed)
-    local initrd_name="initramfs-core.img"
-    if [ ! -f "$dir/boot/$initrd_name" ]; then
-        local cand
-        cand=$(ls "$dir"/boot/initramfs-*.img 2>/dev/null | sort -V | tail -1)
-        [ -n "$cand" ] && initrd_name=$(basename "$cand")
-    fi
-
     local rootfs="$dir"
-    local output_dir="${FOUNDATION_ISO_DIR:-/home/gretagen/Documents/isos}"
-    mkdir -p "$output_dir"
+    local output_dir="${FOUNDATION_ISO_DIR:-/systems}"
+    local output_dir_created=false
+    if [ ! -d "$output_dir" ]; then
+        mkdir -p "$output_dir"
+        output_dir_created=true
+    fi
     local date
     date=$(date +%Y%m%d)
     local output="$output_dir/haliadesys-$date.iso"
@@ -1142,6 +1138,16 @@ CONFEOF
     fi
 
     rm -rf "$iso_root" /tmp/rootfs.squashfs /tmp/initramfs-live /tmp/initramfs-live.img /tmp/squashfs-excludes
+
+    # Under doas everything lands root-owned: hand the artifacts to the
+    # invoking user — the dir only if WE created it (never adopt an
+    # existing system directory), always the ISO itself.
+    if [ -n "${DOAS_USER:-}" ]; then
+        if [ "$output_dir_created" = true ]; then
+            chown "$DOAS_USER" "$output_dir"
+        fi
+        chown "$DOAS_USER" "$output"
+    fi
 
     echo ""
     echo "ISO built successfully."
