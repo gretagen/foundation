@@ -109,13 +109,16 @@ ensure_merge() {
         [ -L "$dir/$d" ] && continue
         mkdir -p "$dir/$t"
         if [ -d "$dir/$d" ]; then
-            # existing real dir (pre-merge tree): move contents up.
-            # Overwrite wins — matches host last-writer semantics (the
-            # host ends with /bin/sh -> busybox, not bash, the same way).
-            ( shopt -s dotglob nullglob
-              files=("$dir/$d"/*)
-              [ ${#files[@]} -eq 0 ] || mv -f "${files[@]}" "$dir/$t/" || true )
-            rmdir "$dir/$d" 2>/dev/null || { warn "could not fully migrate $dir/$d (left in place)"; continue; }
+            # existing real dir (pre-merge tree): MERGE contents up.
+            # Source wins on conflicts — same result as the old mv -f
+            # (host last-writer semantics, e.g. /bin/sh -> busybox) — but
+            # directories must merge: mv refuses "Directory not empty",
+            # which stranded lib/pkgconfig and lib/security in place.
+            if ! cp -a "$dir/$d/." "$dir/$t/"; then
+                warn "could not merge $dir/$d into $dir/$t (left in place)"
+                continue
+            fi
+            rm -rf "$dir/$d"
         fi
         ln -s "$t" "$dir/$d"
     done
