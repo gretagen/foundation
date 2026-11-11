@@ -684,13 +684,91 @@ cmd_clone() {
 }
 
 cmd_deploy() {
-    local dir="${1:-}"
-    [ -n "$dir" ] || die "missing directory (usage: tower deploy <dir>)"
+    local dir=""
+    local pass=false
+    local config=""
+    local -a enable_gens=()
+    local -a enable_house=()
+    local sys_gen_file=""
+    local house_gen_file=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --pass) pass=true; shift ;;
+            --config) config="${2:-}"; shift 2 ;;
+            --enable-generator) enable_gens+=("${2:-}"); shift 2 ;;
+            --enable-house-generator) enable_house+=("${2:-}"); shift 2 ;;
+            --system-generators-file) sys_gen_file="${2:-}"; shift 2 ;;
+            --house-generators-file) house_gen_file="${2:-}"; shift 2 ;;
+            -h|--help) usage ;;
+            --) shift; break ;;
+            *) 
+                if [ -z "$dir" ]; then dir="$1"; else die "unexpected argument: $1"; fi
+                shift ;;
+        esac
+    done
+    [ -n "$dir" ] || die "missing directory (usage: tower deploy <dir> [flags])"
     mkdir -p "$dir"
+
     local zb
     zb=$(zeta_bin) || die "zeta not found"
     echo "Deploying Haliade root filesystem tree at $dir..."
-    ZETA_ROOT="$dir" "$zb" -provide base
+    if [ "$pass" = true ]; then
+        ZETA_ROOT="$dir" "$zb" -provide base --pass
+    else
+        ZETA_ROOT="$dir" "$zb" -provide base
+    fi
+
+    # reproducibility steps
+    if [ -n "$sys_gen_file" ]; then
+        mkdir -p "$dir/etc/nacelle"
+        cp -v "$sys_gen_file" "$dir/etc/nacelle/enabled_system_generators.lua"
+    fi
+    if [ -n "$house_gen_file" ]; then
+        mkdir -p "$dir/etc/nacelle/houses"
+        cp -v "$house_gen_file" "$dir/etc/nacelle/houses/enabled_house_generators.lua"
+    fi
+
+    if [ -x "$dir/usr/bin/nacelle" ]; then
+        for g in "${enable_gens[@]+"${enable_gens[@]}"}"; do
+            [ -n "$g" ] || continue
+            chroot "$dir" /usr/bin/nacelle enable-generator system "$g" || warn "enable-generator failed: $g"
+        done
+        for g in "${enable_house[@]+"${enable_house[@]}"}"; do
+            [ -n "$g" ] || continue
+            chroot "$dir" /usr/bin/nacelle enable-generator house "$g" || warn "enable-generator failed: $g"
+        done
+
+        if [ -n "$config" ]; then
+            echo "Synchronizing Nacelle config: $config"
+            mkdir -p "$dir/etc/nacelle"
+            if [ -f "$config" ]; then
+                cp "$config" "$dir/etc/nacelle/definition.lua"
+            else
+                warn "config file not found: $config"
+            fi
+            printf 'y\n' | chroot "$dir" /usr/bin/nacelle spin system || warn "nacelle sync failed"
+        elif [ -d /etc/nacelle ]; then
+            echo "Copying /etc/nacelle from host system..."
+            rm -rf "$dir/etc/nacelle"
+            mkdir -p "$dir/etc"
+            cp -a /etc/nacelle "$dir/etc/" || warn "failed to copy /etc/nacelle"
+            printf 'y\n' | chroot "$dir" /usr/bin/nacelle spin system || warn "nacelle sync failed"
+        fi
+    else
+        if [ -n "$config" ] || [ -d /etc/nacelle ]; then
+            if [ -d /etc/nacelle ] && [ -z "$config" ]; then
+                echo "Copying /etc/nacelle from host system..."
+                rm -rf "$dir/etc/nacelle"
+                mkdir -p "$dir/etc"
+                cp -a /etc/nacelle "$dir/etc/" || warn "failed to copy /etc/nacelle"
+            elif [ -n "$config" ]; then
+                mkdir -p "$dir/etc/nacelle"
+                [ -f "$config" ] && cp "$config" "$dir/etc/nacelle/definition.lua"
+            fi
+        fi
+        [ ${#enable_gens[@]} -gt 0 ] || [ ${#enable_house[@]} -gt 0 ] && warn "nacelle not found in deployed system; skipping generator enable"
+    fi
+
     echo "Deployed. You can chroot with: tower climb $dir"
     echo "Build an ISO with: tower rebuild $dir"
 }
