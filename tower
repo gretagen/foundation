@@ -1180,7 +1180,7 @@ cmd_enable_generators() {
 cmd_climb() {
     local dir="${1:-}"
     [ -n "$dir" ] || die "missing directory (usage: tower climb <dir> [shell])"
-    [ -d "$dir" ] || die "directory not found: $dir"
+    [ -d "$dir" ] || die "shell not found, are you sure this is a container?"
 
     local shell="${2:-}"
     local pshell="" r_name r_pass r_uid r_gid r_gecos r_home r_shell
@@ -1212,7 +1212,7 @@ cmd_climb() {
             fi
         done
     fi
-    [ -n "$shell" ] || die "No shell found in $dir"
+    [ -n "$shell" ] || die "shell not found, are you sure this is a container?"
 
     command -v bwrap >/dev/null 2>&1 || die "bubblewrap (bwrap) not found"
 
@@ -1287,6 +1287,13 @@ cmd_climb() {
         bwrap_args+=(--setenv XDG_RUNTIME_DIR "$rt")
     fi
 
+    # tilde display: ${dir/#$HOME/~} misbehaves here, so strip-and-prefix
+    # with the verified ${dir#"$HOME"} form instead.
+    local shown="$dir"
+    case "$dir" in
+        "$HOME"/*) shown="~${dir#"$HOME"}" ;;
+    esac
+    echo "climbing into container $shown"
     exec bwrap "${bwrap_args[@]}" "$shell"
 }
 
