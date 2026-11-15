@@ -1,5 +1,5 @@
 #!/bin/bash
-# foundation : Haliade deployment tool (the "pacstrap" of HaliadeSYS)
+# foundation | Haliade deployment tool (the "pacstrap" of HaliadeSYS)
 # Single command: tower
 #
 # Replaces zstrappa. See README.md for usage.
@@ -8,13 +8,29 @@ set -euo pipefail
 # helpers 
 
 die() { echo "error: $*" >&2; exit 1; }
-info() { echo "[info] $*"; }
-ok() { echo "[ok] $*"; }
+info() { echo "$*"; }
+ok() { echo "$*"; }
 warn() { echo "warning: $*" >&2; }
 
 usage() {
     cat <<'EOF'
-foundation | Haliade system deployment tool
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣾⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣼⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢉⡁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠰⣿⣿⠆⢀⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣤⣾⣿⠄⣈⣁⠀⠻⢿⣷⣦⣀⠀⠀⠀⠀⠀⠀⠀⠀
+    ⠀⠀⠀⠀⠀⣀⣤⣴⣿⠿⠛⠉⠀⠀⣿⣿⠀⠀⠀⠈⠙⠿⣷⣤⡀⠀⠀⠀⠀⠀
+    ⠀⠀⠀⠒⠛⠛⠉⠁⠀⠀⠀⠀⠀⠀⣿⣿⠀⠀⠀⠀⠀⠀⠀⠙⠻⣄⠀⠀⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣿⣿⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+    ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⠛⠛⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+    
+tower | Haliade system deployment tool
 "Every wind turbine needs a tower."
 
 Usage:
@@ -30,7 +46,7 @@ Usage:
   tower enable-generators <dir> [system|house] <name...>
   tower help
 
-Subcommands:
+Commands:
   place    Bootstrap a Haliade system onto a drive
   clone    copy the whole live / into a partition.
   deploy   Deploy an Haliade root filesystem tree somewhere.
@@ -55,7 +71,7 @@ Flags (place only):
   --init NAME             Install an init of the user's choice
   --uefi/--bios           Force bootloader mode.
 EOF
-    exit 0
+    exit "${1:-0}"
 }
 
 check_root() {
@@ -98,7 +114,7 @@ HOUSE_GENERATORS_FILE=""
 # usr-merge: the host installs through /bin -> usr/bin, /lib -> usr/lib,
 # /lib64 -> usr/lib64, /sbin -> usr/sbin symlinks while packages ship a
 # mix of bin/ and usr/bin/ paths. A fresh tree without the symlinks ends
-# up split — and every #!/bin/bash script (zeta, subspace-cli, ...) dies
+# up split, and every #!/bin/bash script (zeta, subspace-cli, ...) dies
 # with "No such file or directory" inside climb/chroot. Called before AND
 # after zeta provides (before: files land merged like on the host; after:
 # repairs trees that predate this logic or where commit recreated dirs).
@@ -110,8 +126,8 @@ ensure_merge() {
         mkdir -p "$dir/$t"
         if [ -d "$dir/$d" ]; then
             # existing real dir (pre-merge tree): MERGE contents up.
-            # Source wins on conflicts — same result as the old mv -f
-            # (host last-writer semantics, e.g. /bin/sh -> busybox) — but
+            # Source wins on conflicts, same result as the old mv -f
+            # (host last-writer semantics, e.g. /bin/sh -> busybox), but
             # directories must merge: mv refuses "Directory not empty",
             # which stranded lib/pkgconfig and lib/security in place.
             if ! cp -a "$dir/$d/." "$dir/$t/"; then
@@ -125,7 +141,7 @@ ensure_merge() {
 }
 
 # Default root shell: keep/create root's entry in the tree's /etc/passwd
-# (deployed trees ship no /etc/passwd at all), defaulting to thesh — the
+# (deployed trees ship no /etc/passwd at all), defaulting to thesh: the
 # host convention. A bare name becomes /bin/<name> (valid once merged).
 set_root_shell() {
     local dir="$1" shell="${2:-thesh}"
@@ -618,14 +634,14 @@ run_chronos_rewrite() {
 cmd_place() {
     parse_place "$@"
     local root="${POSITIONAL[0]:-}" boot="${POSITIONAL[1]:-}" home="${POSITIONAL[2]:-}"
-    [ -n "$root" ] || { usage; exit 1; }
+    [ -n "$root" ] || { usage 1; }
     check_root
     validate_device "$root" "root"
     [ -n "$boot" ] && validate_device "$boot" "boot"
     [ -n "$home" ] && validate_device "$home" "home"
 
     if [ "$PASS" != true ]; then
-        read -rp "Bootstrap this Haliade system? this will wipe the whole drive, this action cannot be undone. [Y/n] : " choice
+        read -rp "Bootstrap this Haliade system? This will wipe the whole drive, and the action cannot be undone. [y/N]: " choice
         case "$choice" in
             [Yy]) ;;
             *) echo "Cancelled."; exit 0 ;;
@@ -727,13 +743,13 @@ cmd_place() {
 cmd_clone() {
     parse_clone "$@"
     local root="${POSITIONAL[0]:-}" boot="${POSITIONAL[1]:-}" home="${POSITIONAL[2]:-}"
-    [ -n "$root" ] || { usage; exit 1; }
+    [ -n "$root" ] || { usage 1; }
     check_root
     validate_device "$root" "root"
     [ -n "$boot" ] && validate_device "$boot" "boot"
     [ -n "$home" ] && validate_device "$home" "home"
 
-    read -rp "Clone this Haliade system? this will wipe the whole drive, and this action cannot be undone. [y/N] : " choice
+    read -rp "Clone this Haliade system? This will wipe the whole drive, and the action cannot be undone. [Y/n]: " choice
     case "${choice:-Y}" in
         [Yy]) ;;
         *) echo "Cancelled."; exit 0 ;;
@@ -810,7 +826,7 @@ cmd_deploy() {
     fi
 
     # Root skeleton: proc/sys/dev/pts/dev/shm/run/tmp/var/home. place has
-    # always done this; deploy trees had none — and climb (unprivileged
+    # always done this; deploy trees had none, and climb (unprivileged
     # bwrap) cannot mkdir mountpoints into a root-owned tree, so every
     # --proc/--dev-bind/--tmpfs in climb died with "Permission denied".
     create_dirs "$dir"
@@ -881,7 +897,7 @@ cmd_rebuild() {
     [ -n "$dir" ] || die "missing directory (usage: tower rebuild <dir>)"
     [ -d "$dir" ] || die "directory not found: $dir"
 
-    # auto-detect kernel — `|| true` is load-bearing: with pipefail an
+    # auto-detect kernel: `|| true` is load-bearing: with pipefail an
     # unmatched glob makes ls exit 2 and would kill the script BEFORE
     # die() could print anything (the original silent-failure bug).
     local vmlinuz=""
@@ -1142,7 +1158,7 @@ CONFEOF
     rm -rf "$iso_root" /tmp/rootfs.squashfs /tmp/initramfs-live /tmp/initramfs-live.img /tmp/squashfs-excludes
 
     # Under doas everything lands root-owned: hand the artifacts to the
-    # invoking user — the dir only if WE created it (never adopt an
+    # invoking user: the dir only if WE created it (never adopt an
     # existing system directory), always the ISO itself.
     if [ -n "${DOAS_USER:-}" ]; then
         if [ "$output_dir_created" = true ]; then
@@ -1184,7 +1200,7 @@ cmd_climb() {
 
     local shell="${2:-}"
     local pshell="" r_name r_pass r_uid r_gid r_gecos r_home r_shell
-    #1: root's configured login shell from the tree's passwd — the same
+    #1: root's configured login shell from the tree's passwd, the same
     # value tower deploy/place write via --shell.
     if [ -z "$shell" ] && [ -f "$dir/etc/passwd" ]; then
         while IFS=: read -r r_name r_pass r_uid r_gid r_gecos r_home r_shell; do
@@ -1194,7 +1210,7 @@ cmd_climb() {
             shell="$pshell"
         fi
     fi
-    #2: thesh first — the distro's default shell (covers trees without a
+    #2: thesh first: the distro's default shell (covers trees without a
     # passwd yet), then the historic candidates.
     if [ -z "$shell" ]; then
         for sh in /usr/bin/thesh /bin/thesh /bin/bash /bin/sh /usr/bin/bash /usr/bin/sh /sbin/sh /bin/ash /usr/bin/ash; do
@@ -1251,7 +1267,7 @@ cmd_climb() {
     local rt="/tmp/xdg-runtime"
     local have_rt=false
 
-    # X11 (+ its socket, previously never bound — X11 could not work at all)
+    # X11 (+ its socket, previously never bound; X11 could not work at all)
     if [ -n "${DISPLAY:-}" ]; then
         bwrap_args+=(--setenv DISPLAY "$DISPLAY")
         local xauth_file=""

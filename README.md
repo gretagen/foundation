@@ -11,7 +11,7 @@ Single command: `tower`.
 - `tower clone` : Legacy zstrappa behaviour: copy the whole live `/` into a partition.
 - `tower deploy <dir>` : Deploy an Haliade root filesystem tree (usr-merge layout, host thesh config, default root shell; re-running heals an existing tree).
 - `tower rebuild <dir>` : Build a bootable ISO from a root filesystem tree.
-- `tower enable-generators <dir> [system|house] <name...>` — Enable nacelle generators in a root filesystem tree.
+- `tower enable-generators <dir> [system|house] <name...>`: Enable nacelle generators in a root filesystem tree.
 - `tower climb <dir> [shell]` : Enter a root filesystem tree with bubblewrap. Default shell: the tree root's login shell (from its `/etc/passwd`), else thesh.
 
 ## Examples
