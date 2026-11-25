@@ -1,0 +1,337 @@
+#!/bin/bash
+# capture : Haliade iso building tool
+
+set -euo pipefail
+
+# helpers
+
+die() { echo "error: $*" >&2; exit 1; }
+info() { echo "[info] $*"; }
+ok() { echo "[ok] $*"; }
+warn() { echo "warning: $*" >&2; }
+
+usage() {
+    cat <<'EOF'
+        o#######o
+      o###########o
+     o#############o
+    #################
+    ######  \########o
+   '#;^ _^,/---\#####!
+   ,` /^_ .-~^~-.__\#
+  /    ^\/,,@@@,, ;|
+ |      \!!@@@@@!! ^,
+#.    .\; '9@@@P'   ^, 
+###./^ ----,_^^      /@-._
+              ^--._,o@@@@@@
+                 ^;@@@@@@@@@
+                   ^-;@@@@
+
+capture | Haliade iso builder
+
+Usage: capture <directory>
+
+This command allows you to build an ISO image out of a HaliadeSYS root filesystem tree.
+Make sure you have a kernel installed in the root filesystem tree before building an iso, otherwise it will fail.
+The ISO images are stored in the "/systems" directory.
+They are organized via date, as "haliadesys-$date.iso".
+EOF
+    exit 0
+}
+
+cmd_rebuild() {
+    local dir="${1:-}"
+    [ -n "$dir" ] || die "missing directory (usage: capture <directory>)"
+    [ -d "$dir" ] || die "directory not found: $dir"
+    [ "$(id -u)" -eq 0 ] || die "You need superuser privileges to capture a rootfs."
+
+    # auto-detect kernel — `|| true` is load-bearing: with pipefail an
+    # unmatched glob makes ls exit 2 and would kill the script BEFORE
+    # die() could print anything (the original silent-failure bug).
+    local vmlinuz=""
+    vmlinuz=$(ls -t "$dir"/boot/vmlinuz-* 2>/dev/null | sort -V | tail -1) || true
+    [ -n "$vmlinuz" ] || die "Cannot build an ISO of this tree, Are you sure there is a kernel installed inside?"
+    local vmlinuz_name
+    vmlinuz_name=$(basename "$vmlinuz")
+    echo "Using kernel: $vmlinuz_name"
+
+    local rootfs="$dir"
+    local output_dir="${CAPTURE_ISO_DIR:-/systems}"
+    local output_dir_created=false
+    if [ ! -d "$output_dir" ]; then
+        mkdir -p "$output_dir"
+        output_dir_created=true
+    fi
+    local date
+    date=$(date +%Y%m%d)
+    local output="$output_dir/haliadesys-$date.iso"
+    local iso_root
+    iso_root=$(mktemp -d /tmp/iso_root.XXXXXX)
+
+    # checks
+    for cmd in mksquashfs cpio xorriso; do
+        command -v "$cmd" >/dev/null 2>&1 || die "required command '$cmd' not found"
+    done
+    local limine="$dir/usr/bin/limine"
+    [ -x "$limine" ] || die "limine binary not found at $limine"
+
+    # extra cmdline from definition.lua
+    local extra_cmdline=""
+    if [ -f "$dir/etc/haliade/definition.lua" ]; then
+        extra_cmdline=$(sed -n 's/.*kernel_cmdline[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/etc/haliade/definition.lua" | head -1)
+    fi
+
+    local timeout=15
+    if [ -f "$dir/boot/limine.conf" ]; then
+        timeout=$(grep -m1 '^timeout:' "$dir/boot/limine.conf" 2>/dev/null | grep -oP '\d+' || echo "15")
+    fi
+
+    echo "Building rootfs.squashfs..."
+    rm -f /tmp/rootfs.squashfs
+    cat > /tmp/squashfs-excludes << 'EOFEX'
+dev/
+proc/
+sys/
+run/
+tmp/
+lost+found
+nix/
+usr/lib/go/
+boot/efi.img
+boot/BOOTX64.EFI
+boot/limine-bios-cd.bin
+boot/limine-uefi-cd.bin
+boot/limine-bios.sys
+usr/lib/firmware/qcom/
+usr/lib/firmware/mellanox/
+usr/lib/firmware/qed/
+usr/lib/firmware/netronome/
+usr/lib/firmware/dpaa2/
+usr/lib/firmware/ti-connectivity/
+usr/lib/firmware/radeon/
+EOFEX
+    if [ -d "$dir/usr/lib" ]; then
+        find "$dir/usr/lib" -name '*.a' -printf 'usr/lib/%P\n' >> /tmp/squashfs-excludes 2>/dev/null || true
+        find "$dir/usr/lib" -name '*.la' -printf 'usr/lib/%P\n' >> /tmp/squashfs-excludes 2>/dev/null || true
+    fi
+
+    mksquashfs "$dir" /tmp/rootfs.squashfs -comp zstd -Xcompression-level 15 \
+        -force-uid 0 -force-gid 0 -ef /tmp/squashfs-excludes
+
+    echo "Building live initramfs..."
+    rm -rf /tmp/initramfs-live
+    mkdir -p /tmp/initramfs-live/bin /tmp/initramfs-live/lib64 /tmp/initramfs-live/dev /tmp/initramfs-live/proc /tmp/initramfs-live/sys /tmp/initramfs-live/run /tmp/initramfs-live/sbin
+    cp "$dir"/usr/bin/busybox /tmp/initramfs-live/bin/ 2>/dev/null || true
+    for applet in sh mount umount switch_root mkdir losetup cat sleep echo mknod ln grep sed ls modprobe blkid fsck touch chmod reboot halt poweroff; do
+        ln -sf /bin/busybox /tmp/initramfs-live/bin/$applet 2>/dev/null || true
+    done
+    ln -sf /bin/busybox /tmp/initramfs-live/sbin/modprobe 2>/dev/null || true
+    mkdir -p /tmp/initramfs-live/lib64
+    for lib in ld-linux-x86-64.so.2 libc.so.6 libm.so.6 libresolv.so.2; do
+        [ -f "$dir/usr/lib64/$lib" ] && cp "$dir/usr/lib64/$lib" /tmp/initramfs-live/lib64/
+    done
+    for fw in nvidia i915 xe amdgpu; do
+        if [ -d "$dir/usr/lib/firmware/$fw" ]; then
+            mkdir -p /tmp/initramfs-live/lib/firmware
+            cp -r "$dir/usr/lib/firmware/$fw" /tmp/initramfs-live/lib/firmware/
+        fi
+    done
+
+    cat > /tmp/initramfs-live/init << 'INITEOF'
+#!/bin/sh
+export PATH=/bin:/sbin
+console=/dev/console
+say() { echo "$@" >$console 2>&1; }
+die() { say "FATAL: $@"; sleep 5; echo b > /proc/sysrq-trigger; }
+
+mkdir -p /proc /sys /dev /run
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev
+mount -t tmpfs tmpfs /run
+
+if [ ! -c /dev/loop0 ]; then
+    for i in 0 1 2 3 4 5 6 7; do
+        mknod /dev/loop$i b 7 $i 2>/dev/null
+    done
+fi
+if [ ! -c /dev/loop-control ]; then
+    mknod /dev/loop-control c 10 237 2>/dev/null
+fi
+
+modprobe loop 2>/dev/null
+modprobe usb-storage 2>/dev/null
+modprobe sd_mod 2>/dev/null
+modprobe sr_mod 2>/dev/null
+modprobe isofs 2>/dev/null
+modprobe squashfs 2>/dev/null
+
+ISO_MNT=/mnt/iso
+mkdir -p $ISO_MNT
+ISO_DEV=""
+
+KCMDLINE=$(cat /proc/cmdline 2>/dev/null || true)
+
+find_parts() {
+    for dev in /sys/block/*/; do
+        devname="${dev#/sys/block/}"
+        devname="${devname%/}"
+        case "$devname" in loop*|ram*|dm-*|md*|nbd*) continue ;; esac
+        if [ -b "/dev/$devname" ]; then echo "/dev/$devname"; fi
+    done
+    for dev in /sys/block/*/; do
+        devname="${dev#/sys/block/}"
+        devname="${devname%/}"
+        case "$devname" in loop*|ram*|dm-*|md*|nbd*) continue ;; esac
+        for part in "$dev"*/partition; do
+            [ -f "$part" ] || continue
+            partname="${part#/sys/block/}"
+            partname="${partname%/partition}"
+            echo "/dev/$partname"
+        done
+    done
+}
+
+try_mount_iso() {
+    [ -b "$1" ] || return 1
+    say "Trying $1..."
+    mount -t iso9660 -o ro "$1" $ISO_MNT 2>/dev/null || return 1
+    if [ -f "$ISO_MNT/boot/rootfs.squashfs" ]; then
+        ISO_DEV="$1"
+        return 0
+    fi
+    umount $ISO_MNT 2>/dev/null || true
+    return 1
+}
+
+say "probing your peripherals..."
+attempts=0
+while [ $attempts -lt 30 ]; do
+    parts=$(find_parts)
+    [ -n "$parts" ] && break
+    sleep 0.5
+    attempts=$((attempts + 1))
+done
+
+for devpath in $parts; do
+    try_mount_iso "$devpath" && break
+done
+
+if [ -z "$ISO_DEV" ]; then
+    say "Retrying in 5s..."
+    sleep 5
+    parts=$(find_parts)
+    for devpath in $parts; do
+        try_mount_iso "$devpath" && break
+    done
+fi
+
+if [ -z "$ISO_DEV" ]; then
+    die "No bootable media found"
+fi
+
+say "Found ISO on $ISO_DEV"
+
+mkdir -p /tmp/live/root /tmp/live/upper /tmp/live/work /tmp/live/sysroot
+mount -t squashfs -o ro,loop $ISO_MNT/boot/rootfs.squashfs /tmp/live/root || die "Cannot mount squashfs"
+say "Squashfs mounted OK"
+
+mount -t tmpfs -o rw,noatime,mode=755,size=50% none /tmp/live/upper
+mkdir -p /tmp/live/upper/work /tmp/live/upper/root
+mount -t overlay -o lowerdir=/tmp/live/root,upperdir=/tmp/live/upper/root,workdir=/tmp/live/upper/work none /tmp/live/sysroot || die "Cannot mount overlay"
+say "Overlay mounted OK"
+
+for d in proc sys dev run tmp; do mkdir -p /tmp/live/sysroot/$d; done
+mount --move /proc /tmp/live/sysroot/proc
+mount --move /sys /tmp/live/sysroot/sys
+mount --move /dev /tmp/live/sysroot/dev
+mount -t tmpfs tmpfs /tmp/live/sysroot/run
+mount -t tmpfs tmpfs /tmp/live/sysroot/tmp
+
+[ -c /tmp/live/sysroot/dev/console ] || die "No /dev/console in sysroot"
+[ -f /tmp/live/sysroot/sbin/init ] || die "No /sbin/init in sysroot"
+
+touch /tmp/live/sysroot/fastboot
+
+# no boot animation: boot straight to openrc-init
+INIT=/sbin/openrc-init
+if [ ! -x "/tmp/live/sysroot$INIT" ]; then
+    INIT=/sbin/init
+fi
+exec switch_root /tmp/live/sysroot "$INIT"
+INITEOF
+    chmod +x /tmp/initramfs-live/init
+
+    rm -f /tmp/initramfs-live.img
+    (cd /tmp/initramfs-live && find . -print0 | cpio -o --format=newc --owner root:root --null > /tmp/initramfs-live.img 2>/dev/null)
+    echo "Initramfs size: $(du -h /tmp/initramfs-live.img | cut -f1)"
+
+    echo "Assembling ISO tree..."
+    rm -rf "$iso_root"
+    mkdir -p "$iso_root/boot" "$iso_root/EFI/BOOT"
+
+    cp /tmp/rootfs.squashfs "$iso_root/boot/rootfs.squashfs"
+    cp "$vmlinuz" "$iso_root/boot/"
+    cp /tmp/initramfs-live.img "$iso_root/boot/initramfs-live.img"
+    [ -f "$dir/boot/image.png" ] && cp "$dir/boot/image.png" "$iso_root/boot/" 2>/dev/null || true
+    [ -f "$dir/usr/share/limine/limine-bios-cd.bin" ] && cp "$dir/usr/share/limine/limine-bios-cd.bin" "$iso_root/" 2>/dev/null || true
+    [ -f "$dir/usr/share/limine/limine-uefi-cd.bin" ] && cp "$dir/usr/share/limine/limine-uefi-cd.bin" "$iso_root/" 2>/dev/null || true
+    [ -f "$dir/usr/share/limine/limine-bios.sys" ] && cp "$dir/usr/share/limine/limine-bios.sys" "$iso_root/boot/" 2>/dev/null || true
+    [ -f "$dir/usr/share/limine/BOOTX64.EFI" ] && cp "$dir/usr/share/limine/BOOTX64.EFI" "$iso_root/EFI/BOOT/" 2>/dev/null || true
+
+    cat > "$iso_root/boot/limine.conf" << CONFEOF
+# Limine configuration for Haliade system Live ISO
+
+timeout: $timeout
+serial: yes
+
+/HaliadeSYS live-env
+    protocol: linux
+    kernel_path: boot():/boot/$vmlinuz_name
+    module_path: boot():/boot/initramfs-live.img
+    cmdline: console=tty0 loglevel=7 $extra_cmdline
+CONFEOF
+
+    echo "Creating ISO..."
+    xorriso -as mkisofs -R -J -V HALIADE_SYS -b limine-bios-cd.bin -no-emul-boot \
+        -boot-load-size 4 -boot-info-table --efi-boot limine-uefi-cd.bin \
+        -efi-boot-part --efi-boot-image --protective-msdos-label "$iso_root" \
+        -o "$output" 2>&1 | tail -3
+
+    if [ -x "$limine" ]; then
+        echo "Installing Limine BIOS boot..."
+        "$limine" bios-install "$output" 2>&1 || warn "limine bios-install failed"
+    fi
+
+    rm -rf "$iso_root" /tmp/rootfs.squashfs /tmp/initramfs-live /tmp/initramfs-live.img /tmp/squashfs-excludes
+
+    # Under doas everything lands root-owned: hand the artifacts to the
+    # invoking user — the dir only if WE created it (never adopt an
+    # existing system directory), always the ISO itself.
+    if [ -n "${DOAS_USER:-}" ]; then
+        if [ "$output_dir_created" = true ]; then
+            chown "$DOAS_USER" "$output_dir"
+        fi
+        chown "$DOAS_USER" "$output"
+    fi
+
+    echo ""
+    echo "ISO built successfully."
+    echo "Location: $output"
+    echo "Size: $(du -h "$output" | cut -f1)"
+}
+
+# dispatch
+
+if [ $# -eq 0 ]; then
+    usage
+fi
+
+case "$1" in
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        cmd_rebuild "$1"
+        ;;
+esac

@@ -5,25 +5,328 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
+    ⠀⠀⠀ ⠀⠀⠈⠳⡄⠈⠛⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀
+    ⠀⠀⠀⠀ ⠀⠀⠀⠘⢦⠀⠀⠉⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀
+    ⠀⠀⠀⠀⠀ ⠀⠀⠀⠈⢳⡀⢠⣆⠀⠙⢿⣏⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀
+     ⠀⠀⠀⠀⠀⠀⢠⣤⣤⡀⠙⠘⣿⠀⠀⠀⠈⠀⠈⠻⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀
+     ⠀⠀⠀⠀⠀⠀⠘⠿⣿⡿⠀⣠⣿⡆⠀⠀⠀⠀⠀⠀⠈⠻⣿⣿⣿⣿⣿⣿⡇⠀
+     ⠀⠀⠀⠀⠀⠀⠀⠀⢠⣴⣾⣿⠋⠀⠀⠀⣀⣄⠀⠀⠀⠀⠈⢿⣿⣿⣿⣿⡇⠀
+     ⠀⠀⠀⠀⠀⠀⠀⠀⠘⣿⣿⣿⡦⠀⣠⣾⣿⣿⣿⣦⣴⡟⠀⠀⣿⣿⣿⣿⡇⠀
+     ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⢿⡟⢠⠀⣿⣿⣿⣁⡈⠉⠛⠁⠀⠀⣿⣿⣿⣿⡇⠀
+     ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠏⢰⣿⣿⣿⣿⣿⡄⠀⠀⠀⠀⢸⣿⣿⣿⡇⠀
+     ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⠀⠀⠈⠻⣿⣄⣀⠀⠀⠸⣿⣿⣿⡇⠀
+     ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⡇⠀⠀⠀⠘⠛⠋⠁⠀⠀⣿⣿⣿⡇⠀
+     ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢻⠀⠀⠀⠀⠀⠀⠀⠀⠀⢿⣿⣿⡇⠀
+     ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⡇⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⡇⠀
+     ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⠉⠁⠀
 harness | Haliade autonomous mounting tool
 
-Usage: harness [--flag] {type} <drive/partition>
+Usage: harness <command> {type} <drive/partition> [--flag]
+
+Commands:
+  attach                  Mount a specific drive
+  detach                  Unmount a specific drive
+
 
 Flags:
-  --attach                Mount a specific drive
-  --detach                Unmount a specific drive
+  --generation N          Attach generation N instead of @ (root only,
+                          mounted read-only)
+  --help                  Show this help
 
 Types:
   root                    The root partition of the system you are trying to mount                    
   boot                    The boot partition you are trying to mount
+  home                    The home partition you are trying to mount
 
 You can know which drives are which using lsblk.
 
-After you have attached your drive, you can enter it via changeroot.
+After you have attached your drive, you can enter it via chroot.
 You do not especially need to attach your boot partition.
+
+Mount points:
+  root -> /mnt/haliade                    boot -> /mnt/haliade/boot
+  home -> /mnt/haliade/home
 
 (The harness is designed and built to mount BTRFS drives and respect the Haliade architecture,
 So if you try to use the harness on a system other than HaliadeSYS, you may have trouble.)
 EOF
     exit 0
 }
+
+# helpers
+
+die() { echo "error: $*" >&2; exit 1; }
+warn() { echo "warning: $*" >&2; }
+
+MP="/mnt/haliade"
+
+check_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        die "harness must be run with root privileges"
+    fi
+}
+
+require_blockdev() {
+    local dev="$1" label="$2"
+    [ -b "$dev" ] || die "$label $dev is not a block device"
+}
+
+require_fstype() {
+    local dev="$1" want="$2" label="$3" got
+    got=$(blkid -s TYPE -o value "$dev" 2>/dev/null || true)
+    [ "$got" = "$want" ] || die "$label $dev is not $want (found: ${got:-nothing})"
+}
+
+require_target_free() {
+    local mp="$1"
+    if mountpoint -q "$mp" 2>/dev/null; then
+        die "$mp is already mounted"
+    fi
+}
+
+require_device_free() {
+    # findmnt resolves UUID=/PARTUUID= sources to their device node, but
+    # appends the subvolume as "[/...]", and btrfs reports an anonymous
+    # MAJ:MIN — so normalize SOURCE instead of matching device numbers.
+    # Anything mounted outside our own tree is a conflict: mounting the
+    # same subvolume twice is how you corrupt a btrfs volume.
+    local dev="$1" dev_real target src rest
+    dev_real=$(readlink -f "$dev")
+    while read -r target src rest; do
+        [ -n "$src" ] || continue
+        src="${src%%\[*}"
+        case "$src" in
+            /dev/*) ;;
+            *) continue ;;
+        esac
+        [ "$(readlink -f "$src")" = "$dev_real" ] || continue
+        case "$target" in
+            "$MP"|"$MP"/*) ;;
+            *) die "$dev is already mounted at $target" ;;
+        esac
+    done < <(findmnt -rn -o TARGET,SOURCE 2>/dev/null || true)
+}
+
+# attach
+
+attach_root() {
+    local dev="$1" gen="$2"
+    require_blockdev "$dev" "root"
+    require_fstype "$dev" btrfs "root"
+    require_device_free "$dev"
+    require_target_free "$MP"
+    require_target_free "$MP/.snapshots"
+    # mounting root over an attached boot/home would hide that mount from
+    # every path walk — it could never be detached again, so refuse
+    if mountpoint -q "$MP/boot" 2>/dev/null; then
+        die "$MP/boot is attached — detach it before attaching root"
+    fi
+    if mountpoint -q "$MP/home" 2>/dev/null; then
+        die "$MP/home is attached — detach it before attaching root"
+    fi
+    command -v btrfs >/dev/null 2>&1 || die "required command 'btrfs' not found"
+
+    # validate the Haliade layout on a throwaway top-level mount before
+    # touching the target: a fresh mkfs.btrfs has neither @ nor @snapshots
+    local tl subvols
+    tl=$(mktemp -d /tmp/harness-tl.XXXXXX)
+    if ! mount -t btrfs -o ro,subvol=/ "$dev" "$tl"; then
+        rmdir "$tl" 2>/dev/null || true
+        die "failed to mount $dev for validation"
+    fi
+    subvols=$(btrfs subvolume list "$tl" 2>/dev/null || true)
+    umount "$tl" || die "failed to unmount validation mount at $tl"
+    rmdir "$tl"
+
+    grep -q ' path @$' <<<"$subvols" || die "not a Haliade root filesystem: no '@' subvolume on $dev"
+    grep -q ' path @snapshots$' <<<"$subvols" || die "not a Haliade root filesystem: no '@snapshots' subvolume on $dev"
+
+    if [ -n "$gen" ]; then
+        grep -q " path @snapshots/gen-$gen$" <<<"$subvols" || {
+            local avail
+            avail=$(sed -n 's|.* path @snapshots/gen-\([0-9][0-9]*\)$|\1|p' <<<"$subvols" | sort -n | tr '\n' ' ')
+            avail="${avail% }"
+            die "generation $gen not found (available: ${avail:-none})"
+        }
+    fi
+
+    mkdir -p "$MP"
+    if [ -n "$gen" ]; then
+        mount -t btrfs -o "ro,subvol=@snapshots/gen-$gen" "$dev" "$MP" || die "failed to mount generation $gen"
+    else
+        mount -t btrfs -o "subvol=@,noatime" "$dev" "$MP" || die "failed to mount $dev"
+    fi
+
+    # @snapshots rides along with every root attach — chronos keeps
+    # .current and the gen-N.meta.toml files there. A generation root is
+    # read-only, so its tree must already contain the mountpoint directory.
+    if [ -d "$MP/.snapshots" ]; then
+        if ! mount -t btrfs -o "subvol=@snapshots,noatime" "$dev" "$MP/.snapshots"; then
+            umount "$MP" 2>/dev/null || true
+            die "failed to mount @snapshots"
+        fi
+    elif [ -n "$gen" ]; then
+        warn "@snapshots not mounted: the generation tree has no .snapshots directory"
+    else
+        if ! mkdir -p "$MP/.snapshots"; then
+            umount "$MP" 2>/dev/null || true
+            die "failed to create $MP/.snapshots"
+        fi
+        if ! mount -t btrfs -o "subvol=@snapshots,noatime" "$dev" "$MP/.snapshots"; then
+            umount "$MP" 2>/dev/null || true
+            die "failed to mount @snapshots"
+        fi
+    fi
+
+    # printed last: a failure above must never look like a success
+    if [ -n "$gen" ]; then
+        echo "attached $dev to $MP (generation $gen)"
+    else
+        echo "attached $dev to $MP"
+    fi
+}
+
+attach_boot() {
+    local dev="$1"
+    require_blockdev "$dev" "boot"
+    require_fstype "$dev" vfat "boot"
+    require_device_free "$dev"
+    require_target_free "$MP/boot"
+    if ! mountpoint -q "$MP" 2>/dev/null; then
+        warn "root is not attached — $MP/boot will have no system above it"
+    fi
+    mkdir -p "$MP/boot"
+    mount -t vfat "$dev" "$MP/boot" || die "failed to mount $dev"
+    echo "attached $dev to $MP/boot"
+}
+
+attach_home() {
+    local dev="$1"
+    require_blockdev "$dev" "home"
+    require_fstype "$dev" ext4 "home"
+    require_device_free "$dev"
+    require_target_free "$MP/home"
+    if ! mountpoint -q "$MP" 2>/dev/null; then
+        warn "root is not attached — $MP/home will have no system above it"
+    fi
+    mkdir -p "$MP/home"
+    mount -t ext4 "$dev" "$MP/home" || die "failed to mount $dev"
+    echo "attached $dev to $MP/home"
+}
+
+# detach
+
+detach_root() {
+    local dev="$1" src child
+    require_blockdev "$dev" "root"
+    src=$(findmnt -rn -o SOURCE "$MP" 2>/dev/null || true)
+    [ -n "$src" ] || die "$MP is not attached"
+    src="${src%%\[*}"
+    [ "$(readlink -f "$src")" = "$(readlink -f "$dev")" ] || die "$MP is mounted from $src, not $dev"
+    # children first, same order as tower's cleanup_mounts
+    for child in "$MP/.snapshots" "$MP/home" "$MP/boot"; do
+        if mountpoint -q "$child" 2>/dev/null; then
+            umount "$child" || die "failed to unmount $child — it is in use"
+        fi
+    done
+    umount "$MP" || die "failed to unmount $MP — it is in use"
+    echo "detached $dev from $MP"
+}
+
+detach_leaf() {
+    local dev="$1" mp="$2" label="$3" src
+    require_blockdev "$dev" "$label"
+    src=$(findmnt -rn -o SOURCE "$mp" 2>/dev/null || true)
+    [ -n "$src" ] || die "$mp is not attached"
+    src="${src%%\[*}"
+    [ "$(readlink -f "$src")" = "$(readlink -f "$dev")" ] || die "$mp is mounted from $src, not $dev"
+    umount "$mp" || die "failed to unmount $mp — it is in use"
+    echo "detached $dev from $mp"
+}
+
+# dispatch
+
+ACTION=""
+TYPE=""
+DEV=""
+GENERATION=""
+
+if [ $# -eq 0 ]; then
+    usage
+fi
+
+case "$1" in
+    attach|detach)
+        ACTION="$1"
+        shift
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    --*)
+        die "unknown flag: $1"
+        ;;
+    *)
+        die "unknown command: $1 (expected attach or detach)"
+        ;;
+esac
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --generation)
+            shift
+            [ $# -gt 0 ] || die "--generation needs a number"
+            GENERATION="$1"
+            ;;
+        --help|-h)
+            usage
+            ;;
+        --*)
+            die "unknown flag: $1"
+            ;;
+        *)
+            if [ -z "$TYPE" ]; then
+                TYPE="$1"
+            elif [ -z "$DEV" ]; then
+                DEV="$1"
+            else
+                die "unexpected argument: $1"
+            fi
+            ;;
+    esac
+    shift
+done
+
+[ -n "$TYPE" ] || die "missing {type} (root, boot or home)"
+[ -n "$DEV" ] || die "missing <drive/partition>"
+
+case "$TYPE" in
+    root|boot|home) ;;
+    *) die "unknown type: $TYPE (expected root, boot or home)" ;;
+esac
+
+if [ -n "$GENERATION" ]; then
+    if [ "$ACTION" != "attach" ] || [ "$TYPE" != "root" ]; then
+        die "--generation only works with: harness attach root"
+    fi
+    GENERATION="${GENERATION#gen-}"
+    case "$GENERATION" in
+        ''|*[!0-9]*) die "invalid generation: expected a number (e.g. 3 or gen-3)" ;;
+    esac
+fi
+
+check_root
+
+if [ "$ACTION" = "attach" ]; then
+    case "$TYPE" in
+        root) attach_root "$DEV" "$GENERATION" ;;
+        boot) attach_boot "$DEV" ;;
+        home) attach_home "$DEV" ;;
+    esac
+else
+    case "$TYPE" in
+        root) detach_root "$DEV" ;;
+        boot) detach_leaf "$DEV" "$MP/boot" boot ;;
+        home) detach_leaf "$DEV" "$MP/home" home ;;
+    esac
+fi
