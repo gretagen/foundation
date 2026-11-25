@@ -142,7 +142,7 @@ EOFEX
 export PATH=/bin:/sbin
 console=/dev/console
 say() { echo "$@" >$console 2>&1; }
-die() { say "FATAL: $@"; sleep 5; echo b > /proc/sysrq-trigger; }
+die() { say "FATAL: $@"; exit 1; }
 
 mkdir -p /proc /sys /dev /run
 mount -t proc none /proc
