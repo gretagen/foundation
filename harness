@@ -1,0 +1,29 @@
+#!/bin/bash
+# harness : Haliade autonomous mounting tool
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+harness | Haliade autonomous mounting tool
+
+Usage: harness [--flag] {type} <drive/partition>
+
+Flags:
+  --attach                Mount a specific drive
+  --detach                Unmount a specific drive
+
+Types:
+  root                    The root partition of the system you are trying to mount                    
+  boot                    The boot partition you are trying to mount
+
+You can know which drives are which using lsblk.
+
+After you have attached your drive, you can enter it via changeroot.
+You do not especially need to attach your boot partition.
+
+(The harness is designed and built to mount BTRFS drives and respect the Haliade architecture,
+So if you try to use the harness on a system other than HaliadeSYS, you may have trouble.)
+EOF
+    exit 0
+}
